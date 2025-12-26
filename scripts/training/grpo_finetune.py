@@ -1,0 +1,902 @@
+#!/usr/bin/env python3
+"""
+GRPO (Group Relative Policy Optimization) Fine-tuning Script for Qwen-VL.
+
+GRPO 是一种高效的强化学习微调方法，通过组内相对优势来优化策略，
+不需要单独的奖励模型。
+
+Usage:
+    python scripts/grpo_finetune.py \
+        --model_path Qwen/Qwen3-VL-2B-Instruct \
+        --train_data data/qwen_data/train.json \
+        --output_dir outputs/qwen3vl_grpo
+
+References:
+    - DeepSeekMath: https://arxiv.org/abs/2402.03300
+    - TRL GRPO: https://huggingface.co/docs/trl/grpo_trainer
+"""
+
+import os
+import re
+import json
+import time
+import argparse
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any, Tuple
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from tqdm import tqdm
+
+from transformers import (
+    AutoProcessor,
+    BitsAndBytesConfig,
+    GenerationConfig,
+)
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+    TaskType,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+def get_model_class(model_path: str):
+    """根据模型路径返回对应的模型类"""
+    model_path_lower = model_path.lower()
+    if "qwen3" in model_path_lower:
+        from transformers import Qwen3VLForConditionalGeneration
+        return Qwen3VLForConditionalGeneration
+    else:
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        return Qwen2_5_VLForConditionalGeneration
+
+
+@dataclass
+class GRPOConfig:
+    """GRPO training configuration."""
+    # Model
+    model_path: str = "Qwen/Qwen3-VL-2B-Instruct"
+    use_4bit: bool = True
+    use_8bit: bool = False
+
+    # LoRA
+    lora_r: int = 64
+    lora_alpha: int = 16
+    lora_dropout: float = 0.1
+    lora_target_modules: List[str] = field(default_factory=lambda: [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj"
+    ])
+
+    # Data
+    train_data: str = "data/qwen_data/train.json"
+    max_length: int = 2048
+    max_new_tokens: int = 512  # 检测 JSON 输出通常不需要太长
+    max_image_size: int = 512  # 图片最大边长
+
+    # GRPO specific
+    num_generations: int = 4  # 每个样本生成的响应数量 (G)
+    temperature: float = 0.7  # 生成时的温度
+    kl_coef: float = 0.1  # KL 散度系数
+    clip_range: float = 0.2  # PPO-style clipping
+
+    # Training
+    output_dir: str = "outputs/qwen3vl_grpo"
+    num_epochs: int = 1
+    batch_size: int = 1  # 每个 batch 的样本数
+    gradient_accumulation_steps: int = 4
+    learning_rate: float = 1e-5
+    warmup_ratio: float = 0.1
+    weight_decay: float = 0.01
+    logging_steps: int = 10
+    save_steps: int = 200
+    max_grad_norm: float = 1.0
+
+    # Reward weights
+    reward_format_weight: float = 1.0  # 格式正确性权重
+    reward_bbox_weight: float = 2.0    # 边界框准确性权重
+    reward_category_weight: float = 1.5  # 类别准确性权重
+    reward_confidence_weight: float = 0.5  # 置信度校准权重
+
+    # Other
+    seed: int = 42
+    bf16: bool = True
+
+
+class RewardCalculator:
+    """计算检测结果的奖励分数"""
+
+    def __init__(self, config: GRPOConfig):
+        self.config = config
+
+    def parse_box_format(self, text: str) -> List[Dict]:
+        """
+        解析 <box>(x1,y1),(x2,y2)</box> 格式的检测结果
+
+        返回: [{"category": "设备类型", "status": "正常/异常", "bbox": [x1,y1,x2,y2]}, ...]
+        """
+        detections = []
+
+        # 匹配 <box>(x1,y1),(x2,y2)</box> 格式
+        box_pattern = r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>'
+
+        # 按段落分割，每个检测项通常以数字开头
+        # 格式: 1. 设备类型\n   - 状态：...\n   - 位置：<box>...</box>
+        item_pattern = r'(\d+)\.\s*([^\n]+).*?(?:状态[：:]\s*([^\n]+))?.*?<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>'
+
+        matches = re.findall(item_pattern, text, re.DOTALL)
+
+        for match in matches:
+            try:
+                category = match[1].strip()
+                status = match[2].strip() if match[2] else "正常"
+                x1, y1, x2, y2 = int(match[3]), int(match[4]), int(match[5]), int(match[6])
+
+                # 判断是否异常
+                is_anomaly = any(kw in status for kw in ["异常", "全灭", "损坏", "故障", "破损", "不亮", "错误"])
+
+                detections.append({
+                    "category": category,
+                    "status": status,
+                    "is_anomaly": is_anomaly,
+                    "bbox": [x1, y1, x2, y2]
+                })
+            except (ValueError, IndexError):
+                continue
+
+        # 如果上面的模式没匹配到，尝试只提取 box 坐标
+        if not detections:
+            simple_matches = re.findall(box_pattern, text)
+            for match in simple_matches:
+                try:
+                    x1, y1, x2, y2 = int(match[0]), int(match[1]), int(match[2]), int(match[3])
+                    detections.append({
+                        "category": "unknown",
+                        "status": "unknown",
+                        "is_anomaly": False,
+                        "bbox": [x1, y1, x2, y2]
+                    })
+                except ValueError:
+                    continue
+
+        return detections
+
+    def compute_iou(self, box1: List[float], box2: List[float]) -> float:
+        """计算两个边界框的 IoU"""
+        if len(box1) != 4 or len(box2) != 4:
+            return 0.0
+
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
+
+    def compute_reward(
+        self,
+        generated_text: str,
+        ground_truth: Dict,
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        计算生成结果的奖励分数
+
+        Args:
+            generated_text: 模型生成的文本
+            ground_truth: 真实标注 (包含 detections 等字段)
+
+        Returns:
+            total_reward: 总奖励分数
+            reward_breakdown: 各项奖励分解
+        """
+        rewards = {
+            "format": 0.0,
+            "bbox": 0.0,
+            "category": 0.0,
+            "completeness": 0.0,
+        }
+
+        # 解析生成的文本 (支持 <box> 格式)
+        pred_detections = self.parse_box_format(generated_text)
+        gt_detections = ground_truth.get("detections", [])
+
+        # 1. 格式正确性奖励
+        has_box = len(pred_detections) > 0
+        has_structure = "检测到" in generated_text or "未检测到" in generated_text
+
+        if has_box or has_structure:
+            rewards["format"] = 1.0
+        elif generated_text.strip():
+            rewards["format"] = 0.3  # 有输出但格式不对
+        else:
+            rewards["format"] = -1.0  # 空输出
+
+        # 如果没有真实检测
+        if not gt_detections:
+            if not pred_detections:
+                # 正确预测没有设备
+                rewards["bbox"] = 1.0
+                rewards["category"] = 1.0
+                rewards["completeness"] = 1.0
+            else:
+                # 预测了不存在的设备 (false positive)
+                rewards["bbox"] = -0.3
+                rewards["category"] = -0.3
+                rewards["completeness"] = 0.5
+        else:
+            # 2. 边界框准确性奖励 (基于最佳匹配 IoU)
+            if pred_detections:
+                ious = []
+                category_matches = []
+
+                for gt_det in gt_detections:
+                    gt_bbox = gt_det.get("bbox", [])
+                    gt_category = gt_det.get("category", "")
+
+                    best_iou = 0.0
+                    best_cat_match = False
+
+                    for pred_det in pred_detections:
+                        pred_bbox = pred_det.get("bbox", [])
+                        pred_category = pred_det.get("category", "")
+
+                        if gt_bbox and pred_bbox:
+                            iou = self.compute_iou(gt_bbox, pred_bbox)
+                            if iou > best_iou:
+                                best_iou = iou
+                                # 类别模糊匹配
+                                best_cat_match = (
+                                    gt_category in pred_category or
+                                    pred_category in gt_category or
+                                    gt_category == pred_category
+                                )
+
+                    ious.append(best_iou)
+                    category_matches.append(best_cat_match)
+
+                # 平均 IoU 作为 bbox 奖励
+                avg_iou = sum(ious) / len(ious) if ious else 0.0
+                rewards["bbox"] = avg_iou * 2 - 1  # 映射到 [-1, 1]
+
+                # 类别匹配率作为 category 奖励
+                cat_match_rate = sum(category_matches) / len(category_matches) if category_matches else 0.0
+                rewards["category"] = cat_match_rate * 2 - 1
+
+                # 完整性奖励 (检测到的比例)
+                completeness = min(len(pred_detections) / len(gt_detections), 1.0)
+                rewards["completeness"] = completeness * 2 - 1
+            else:
+                # 没有预测任何检测 (false negative)
+                rewards["bbox"] = -1.0
+                rewards["category"] = -1.0
+                rewards["completeness"] = -1.0
+
+        # 计算总奖励
+        weights = [
+            self.config.reward_format_weight,
+            self.config.reward_bbox_weight,
+            self.config.reward_category_weight,
+            self.config.reward_confidence_weight,  # 用于 completeness
+        ]
+        total = sum(r * w for r, w in zip(rewards.values(), weights))
+
+        return total, rewards
+
+
+class GRPODataset(Dataset):
+    """GRPO 训练数据集"""
+
+    def __init__(self, data_path: str, processor, max_length: int = 2048, max_image_size: int = 512):
+        self.processor = processor
+        self.max_length = max_length
+        self.max_image_size = max_image_size
+
+        with open(data_path, 'r', encoding='utf-8') as f:
+            self.data = json.load(f)
+
+        logger.info(f"Loaded {len(self.data)} samples from {data_path}")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx) -> Dict[str, Any]:
+        item = self.data[idx]
+
+        image_path = item["image"]
+        conversations = item["conversations"]
+
+        # Load image
+        try:
+            image = Image.open(image_path).convert("RGB")
+            # 限制图片大小以减少显存占用
+            if self.max_image_size and max(image.size) > self.max_image_size:
+                ratio = self.max_image_size / max(image.size)
+                new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
+                image = image.resize(new_size, Image.LANCZOS)
+        except Exception as e:
+            logger.warning(f"Failed to load image {image_path}: {e}")
+            image = Image.new("RGB", (224, 224), color="white")
+
+        # Extract messages
+        user_msg = conversations[0]["value"]
+        assistant_msg = conversations[1]["value"]
+
+        # 解析 ground truth
+        ground_truth = self._parse_ground_truth(assistant_msg)
+
+        return {
+            "image": image,
+            "prompt": user_msg.replace("<image>\n", "").replace("<image>", ""),
+            "ground_truth": ground_truth,
+            "reference_response": assistant_msg,
+        }
+
+    def _parse_ground_truth(self, response: str) -> Dict:
+        """从参考响应中解析 ground truth (支持 <box> 格式)"""
+        detections = []
+
+        # 解析 <box>(x1,y1),(x2,y2)</box> 格式
+        # 格式: 1. 设备类型\n   - 状态：...\n   - 位置：<box>...</box>
+        item_pattern = r'(\d+)\.\s*([^\n]+).*?(?:状态[：:]\s*([^\n]+))?.*?<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>'
+
+        matches = re.findall(item_pattern, response, re.DOTALL)
+
+        for match in matches:
+            try:
+                category = match[1].strip()
+                status = match[2].strip() if match[2] else "正常"
+                x1, y1, x2, y2 = int(match[3]), int(match[4]), int(match[5]), int(match[6])
+
+                is_anomaly = any(kw in status for kw in ["异常", "全灭", "损坏", "故障", "破损", "不亮", "错误"])
+
+                detections.append({
+                    "category": category,
+                    "status": status,
+                    "is_anomaly": is_anomaly,
+                    "bbox": [x1, y1, x2, y2]
+                })
+            except (ValueError, IndexError):
+                continue
+
+        # 如果没匹配到完整格式，尝试只提取 box
+        if not detections:
+            box_pattern = r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>'
+            simple_matches = re.findall(box_pattern, response)
+            for match in simple_matches:
+                try:
+                    x1, y1, x2, y2 = int(match[0]), int(match[1]), int(match[2]), int(match[3])
+                    detections.append({
+                        "category": "unknown",
+                        "bbox": [x1, y1, x2, y2]
+                    })
+                except ValueError:
+                    continue
+
+        has_anomaly = any(d.get("is_anomaly", False) for d in detections)
+
+        return {
+            "has_anomaly": has_anomaly,
+            "detections": detections,
+            "summary": response[:200]
+        }
+
+
+class GRPOTrainer:
+    """GRPO 训练器"""
+
+    def __init__(
+        self,
+        model,
+        ref_model,
+        processor,
+        config: GRPOConfig,
+        reward_calculator: RewardCalculator,
+    ):
+        self.model = model
+        self.ref_model = ref_model  # 参考模型（frozen）
+        self.processor = processor
+        self.config = config
+        self.reward_calculator = reward_calculator
+
+        # 优化器
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+
+        self.global_step = 0
+
+    @torch.no_grad()
+    def generate_responses(
+        self,
+        image: Image.Image,
+        prompt: str,
+        num_generations: int,
+    ) -> List[str]:
+        """为单个样本生成多个响应"""
+        # 生成时需要切换到 eval 模式，避免 gradient checkpointing 干扰
+        was_training = self.model.training
+        self.model.eval()
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+
+        text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        inputs = self.processor(
+            text=[text],
+            images=[image],
+            return_tensors="pt",
+        ).to(self.model.device)
+
+        # 批量生成所有响应 (更高效)
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=self.config.max_new_tokens,
+            do_sample=True,
+            temperature=self.config.temperature,
+            top_p=0.9,
+            num_return_sequences=num_generations,
+            pad_token_id=self.processor.tokenizer.pad_token_id,
+        )
+
+        # 解码所有响应
+        generated_ids = outputs[:, inputs["input_ids"].shape[1]:]
+        responses = self.processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        # 恢复训练模式
+        if was_training:
+            self.model.train()
+
+        return responses
+
+    def compute_log_probs(
+        self,
+        model,
+        image: Image.Image,
+        prompt: str,
+        response: str,
+    ) -> torch.Tensor:
+        """计算给定响应的 log 概率"""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": response},
+                ],
+            }
+        ]
+
+        text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+
+        inputs = self.processor(
+            text=[text],
+            images=[image],
+            return_tensors="pt",
+            padding=True,
+            truncation=False,  # 不截断，避免图像 token 丢失
+        ).to(model.device)
+
+        # Forward pass
+        outputs = model(**inputs, labels=inputs["input_ids"])
+
+        # 返回平均 log 概率
+        return -outputs.loss  # loss 是负 log likelihood
+
+    def grpo_step(
+        self,
+        image: Image.Image,
+        prompt: str,
+        ground_truth: Dict,
+    ) -> Dict[str, float]:
+        """执行单个 GRPO 更新步骤"""
+        step_start = time.time()
+
+        # 1. 生成多个响应
+        gen_start = time.time()
+        responses = self.generate_responses(
+            image, prompt, self.config.num_generations
+        )
+        gen_time = time.time() - gen_start
+
+        # 2. 计算每个响应的奖励
+        rewards = []
+        reward_breakdowns = []
+        for response in responses:
+            reward, breakdown = self.reward_calculator.compute_reward(
+                response, ground_truth
+            )
+            rewards.append(reward)
+            reward_breakdowns.append(breakdown)
+
+        rewards = torch.tensor(rewards, device=self.model.device)
+
+        # 3. 计算组内相对优势 (Group Relative Advantage)
+        # A_i = (r_i - mean(r)) / (std(r) + eps)
+        mean_reward = rewards.mean()
+        std_reward = rewards.std() + 1e-8
+        advantages = (rewards - mean_reward) / std_reward
+
+        # 4. 计算策略损失
+        logprob_start = time.time()
+        total_loss = 0.0
+        for i, (response, advantage) in enumerate(zip(responses, advantages)):
+            # 当前策略的 log 概率
+            log_prob = self.compute_log_probs(
+                self.model, image, prompt, response
+            )
+
+            # 参考策略的 log 概率 (for KL penalty)
+            with torch.no_grad():
+                ref_log_prob = self.compute_log_probs(
+                    self.ref_model, image, prompt, response
+                )
+
+            # KL 散度惩罚
+            kl_div = log_prob - ref_log_prob
+
+            # GRPO 损失: -advantage * log_prob + kl_coef * kl_div
+            loss = -advantage * log_prob + self.config.kl_coef * kl_div
+            total_loss = total_loss + loss
+        logprob_time = time.time() - logprob_start
+
+        # 平均损失
+        total_loss = total_loss / self.config.num_generations
+
+        # 5. 反向传播
+        backward_start = time.time()
+        total_loss.backward()
+        backward_time = time.time() - backward_start
+
+        total_time = time.time() - step_start
+        if self.global_step % 10 == 0:
+            logger.info(
+                f"Step timing: gen={gen_time:.1f}s, logprob={logprob_time:.1f}s, "
+                f"backward={backward_time:.1f}s, total={total_time:.1f}s"
+            )
+
+        # 返回统计信息
+        return {
+            "loss": total_loss.item(),
+            "mean_reward": mean_reward.item(),
+            "std_reward": std_reward.item(),
+            "max_reward": rewards.max().item(),
+            "min_reward": rewards.min().item(),
+        }
+
+    def train(self, dataset: GRPODataset):
+        """训练循环"""
+        logger.info("Starting GRPO training...")
+
+        # 自定义 collate_fn，保留 PIL Image 不做转换
+        def collate_fn(batch):
+            return {
+                "image": [item["image"] for item in batch],
+                "prompt": [item["prompt"] for item in batch],
+                "ground_truth": [item["ground_truth"] for item in batch],
+                "reference_response": [item["reference_response"] for item in batch],
+            }
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+        )
+
+        self.model.train()
+        accumulated_steps = 0
+        epoch_stats = []
+
+        for epoch in range(self.config.num_epochs):
+            logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs}")
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
+
+            for batch_idx, batch in enumerate(pbar):
+                if batch_idx == 0:
+                    logger.info("Processing first batch...")
+
+                # 遍历 batch 中的每个样本
+                batch_stats = []
+                for i in range(len(batch["image"])):
+                    image = batch["image"][i]
+                    prompt = batch["prompt"][i]
+                    ground_truth = batch["ground_truth"][i]
+
+                    # GRPO step
+                    stats = self.grpo_step(image, prompt, ground_truth)
+                    batch_stats.append(stats)
+                    accumulated_steps += 1
+
+                # 记录 batch 平均统计
+                avg_stats = {
+                    "loss": sum(s["loss"] for s in batch_stats) / len(batch_stats),
+                    "mean_reward": sum(s["mean_reward"] for s in batch_stats) / len(batch_stats),
+                }
+                epoch_stats.append(avg_stats)
+
+                if batch_idx == 0:
+                    logger.info(f"First batch completed: loss={avg_stats['loss']:.4f}, reward={avg_stats['mean_reward']:.4f}")
+
+                # 梯度累积
+                if accumulated_steps % self.config.gradient_accumulation_steps == 0:
+                    # 梯度裁剪
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.max_grad_norm
+                    )
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    self.global_step += 1
+
+                    # 日志
+                    if self.global_step % self.config.logging_steps == 0:
+                        avg_loss = sum(s["loss"] for s in epoch_stats[-self.config.logging_steps:]) / self.config.logging_steps
+                        avg_reward = sum(s["mean_reward"] for s in epoch_stats[-self.config.logging_steps:]) / self.config.logging_steps
+                        logger.info(
+                            f"Step {self.global_step}: loss={avg_loss:.4f}, "
+                            f"mean_reward={avg_reward:.4f}"
+                        )
+
+                    # 保存检查点
+                    if self.global_step % self.config.save_steps == 0:
+                        self.save_checkpoint(f"checkpoint-{self.global_step}")
+
+                # 更新进度条
+                pbar.set_postfix({
+                    "loss": f"{avg_stats['loss']:.4f}",
+                    "reward": f"{avg_stats['mean_reward']:.4f}",
+                })
+
+        # 保存最终模型
+        self.save_checkpoint("final")
+        logger.info("GRPO training completed!")
+
+    def save_checkpoint(self, name: str):
+        """保存检查点"""
+        save_path = os.path.join(self.config.output_dir, name)
+        os.makedirs(save_path, exist_ok=True)
+
+        # 保存 LoRA 权重
+        self.model.save_pretrained(save_path)
+        self.processor.save_pretrained(save_path)
+
+        # 保存配置
+        config_path = os.path.join(save_path, "grpo_config.json")
+        with open(config_path, 'w') as f:
+            json.dump(vars(self.config), f, indent=2, default=str)
+
+        logger.info(f"Checkpoint saved to {save_path}")
+
+
+def create_model_and_processor(config: GRPOConfig):
+    """创建模型和处理器"""
+    logger.info(f"Loading model from {config.model_path}")
+
+    model_class = get_model_class(config.model_path)
+    logger.info(f"Using model class: {model_class.__name__}")
+
+    # 量化配置
+    bnb_config = None
+    if config.use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16 if config.bf16 else torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+    elif config.use_8bit:
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+
+    # 加载模型
+    model = model_class.from_pretrained(
+        config.model_path,
+        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16 if config.bf16 else torch.float16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+
+    # 加载处理器
+    processor = AutoProcessor.from_pretrained(
+        config.model_path,
+        trust_remote_code=True,
+    )
+
+    # 准备 k-bit 训练
+    if config.use_4bit or config.use_8bit:
+        model = prepare_model_for_kbit_training(model)
+
+    # 配置 LoRA
+    lora_config = LoraConfig(
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        target_modules=config.lora_target_modules,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
+    return model, processor
+
+
+def create_reference_model(config: GRPOConfig):
+    """创建参考模型 (frozen)"""
+    logger.info("Loading reference model...")
+
+    model_class = get_model_class(config.model_path)
+
+    # 量化配置
+    bnb_config = None
+    if config.use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16 if config.bf16 else torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+
+    ref_model = model_class.from_pretrained(
+        config.model_path,
+        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16 if config.bf16 else torch.float16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+
+    # 冻结参考模型
+    ref_model.eval()
+    for param in ref_model.parameters():
+        param.requires_grad = False
+
+    return ref_model
+
+
+def main():
+    parser = argparse.ArgumentParser(description="GRPO fine-tuning for Qwen-VL")
+
+    # Model arguments
+    parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-VL-2B-Instruct")
+    parser.add_argument("--use_4bit", action="store_true", default=True)
+    parser.add_argument("--use_8bit", action="store_true")
+
+    # LoRA arguments
+    parser.add_argument("--lora_r", type=int, default=64)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_dropout", type=float, default=0.1)
+
+    # Data arguments
+    parser.add_argument("--train_data", type=str, required=True)
+    parser.add_argument("--max_length", type=int, default=2048)
+    parser.add_argument("--max_image_size", type=int, default=512,
+                        help="Maximum image size (longest edge)")
+
+    # GRPO arguments
+    parser.add_argument("--num_generations", type=int, default=4)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--kl_coef", type=float, default=0.1)
+
+    # Training arguments
+    parser.add_argument("--output_dir", type=str, default="outputs/qwen3vl_grpo")
+    parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Batch size (建议保持1，用gradient_accumulation代替)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--save_steps", type=int, default=200)
+
+    # Other
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--bf16", action="store_true", default=True)
+
+    args = parser.parse_args()
+
+    # 创建配置
+    config = GRPOConfig(
+        model_path=args.model_path,
+        use_4bit=args.use_4bit and not args.use_8bit,
+        use_8bit=args.use_8bit,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        train_data=args.train_data,
+        max_length=args.max_length,
+        max_image_size=args.max_image_size,
+        num_generations=args.num_generations,
+        temperature=args.temperature,
+        kl_coef=args.kl_coef,
+        output_dir=args.output_dir,
+        num_epochs=args.num_epochs,
+        batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        seed=args.seed,
+        bf16=args.bf16,
+    )
+
+    # 设置随机种子
+    torch.manual_seed(config.seed)
+
+    # 创建输出目录
+    os.makedirs(config.output_dir, exist_ok=True)
+
+    # 保存配置
+    with open(os.path.join(config.output_dir, "grpo_config.json"), 'w') as f:
+        json.dump(vars(config), f, indent=2, default=str)
+
+    # 创建模型
+    model, processor = create_model_and_processor(config)
+    ref_model = create_reference_model(config)
+
+    # 创建数据集
+    dataset = GRPODataset(config.train_data, processor, config.max_length, config.max_image_size)
+
+    # 创建奖励计算器
+    reward_calculator = RewardCalculator(config)
+
+    # 创建训练器
+    trainer = GRPOTrainer(
+        model=model,
+        ref_model=ref_model,
+        processor=processor,
+        config=config,
+        reward_calculator=reward_calculator,
+    )
+
+    # 开始训练
+    trainer.train(dataset)
+
+
+if __name__ == "__main__":
+    main()

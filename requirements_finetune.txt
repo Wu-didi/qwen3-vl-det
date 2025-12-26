@@ -1,0 +1,25 @@
+# Fine-tuning dependencies for Qwen-VL (Qwen3-VL / Qwen2.5-VL)
+# Install with: pip install -r requirements_finetune.txt
+
+# Core
+torch>=2.1.0
+transformers>=4.45.0  # Qwen3-VL 需要较新版本
+accelerate>=0.27.0
+
+# LoRA/QLoRA
+peft>=0.10.0
+bitsandbytes>=0.42.0
+
+# Data processing
+datasets>=2.14.0
+Pillow>=9.0.0
+
+# Qwen-VL specific
+qwen-vl-utils>=0.0.8
+
+# Training utilities
+tqdm>=4.65.0
+tensorboard>=2.14.0
+
+# Optional: For faster tokenization
+tiktoken>=0.5.0

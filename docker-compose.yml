@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  traffic-detector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: traffic-anomaly-detector:latest
+    container_name: traffic-detector
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount model cache to persist downloaded models
+      - ./model_cache:/app/model_cache
+      # Mount examples for testing
+      - ./examples:/app/examples
+    environment:
+      - MODEL_NAME=Qwen/Qwen3-VL-8B-Instruct
+      - MODEL_CACHE_DIR=/app/model_cache
+      - DEVICE=cuda
+      - TORCH_DTYPE=bfloat16
+      - MAX_NEW_TOKENS=2048
+      - CONFIDENCE_THRESHOLD=0.5
+      - MAX_IMAGE_SIZE=1280
+      - LOG_LEVEL=INFO
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 300s
+
+  # Optional: Nginx reverse proxy for production
+  # nginx:
+  #   image: nginx:alpine
+  #   ports:
+  #     - "80:80"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #   depends_on:
+  #     - traffic-detector
