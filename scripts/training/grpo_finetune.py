@@ -66,6 +66,7 @@ class GRPOConfig:
     """GRPO training configuration."""
     # Model
     model_path: str = "Qwen/Qwen3-VL-2B-Instruct"
+    sft_model_path: str = ""  # SFT 微调后的 LoRA 模型路径 (可选)
     use_4bit: bool = True
     use_8bit: bool = False
 
@@ -127,35 +128,44 @@ class RewardCalculator:
         """
         detections = []
 
-        # 匹配 <box>(x1,y1),(x2,y2)</box> 格式
-        box_pattern = r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>'
+        # 按序号分割每个检测项
+        items = re.split(r'(?=\d+\.\s+)', text)
 
-        # 按段落分割，每个检测项通常以数字开头
-        # 格式: 1. 设备类型\n   - 状态：...\n   - 位置：<box>...</box>
-        item_pattern = r'(\d+)\.\s*([^\n]+).*?(?:状态[：:]\s*([^\n]+))?.*?<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>'
-
-        matches = re.findall(item_pattern, text, re.DOTALL)
-
-        for match in matches:
-            try:
-                category = match[1].strip()
-                status = match[2].strip() if match[2] else "正常"
-                x1, y1, x2, y2 = int(match[3]), int(match[4]), int(match[5]), int(match[6])
-
-                # 判断是否异常
-                is_anomaly = any(kw in status for kw in ["异常", "全灭", "损坏", "故障", "破损", "不亮", "错误"])
-
-                detections.append({
-                    "category": category,
-                    "status": status,
-                    "is_anomaly": is_anomaly,
-                    "bbox": [x1, y1, x2, y2]
-                })
-            except (ValueError, IndexError):
+        for item in items:
+            if not item.strip():
                 continue
 
-        # 如果上面的模式没匹配到，尝试只提取 box 坐标
+            # 提取类别 (序号后面的第一行)
+            cat_match = re.match(r'(\d+)\.\s*([^\n]+)', item)
+            if not cat_match:
+                continue
+
+            category = cat_match.group(2).strip()
+
+            # 提取状态
+            status_match = re.search(r'状态[：:]\s*([^\n]+)', item)
+            status = status_match.group(1).strip() if status_match else "正常"
+
+            # 提取坐标
+            box_match = re.search(r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>', item)
+            if not box_match:
+                continue
+
+            x1, y1, x2, y2 = int(box_match.group(1)), int(box_match.group(2)), int(box_match.group(3)), int(box_match.group(4))
+
+            # 判断是否异常
+            is_anomaly = any(kw in status for kw in ["异常", "全灭", "损坏", "故障", "破损", "不亮", "错误", "黑屏", "全亮"])
+
+            detections.append({
+                "category": category,
+                "status": status,
+                "is_anomaly": is_anomaly,
+                "bbox": [x1, y1, x2, y2]
+            })
+
+        # 如果上面没匹配到，尝试只提取 box 坐标
         if not detections:
+            box_pattern = r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>'
             simple_matches = re.findall(box_pattern, text)
             for match in simple_matches:
                 try:
@@ -353,28 +363,39 @@ class GRPODataset(Dataset):
         """从参考响应中解析 ground truth (支持 <box> 格式)"""
         detections = []
 
-        # 解析 <box>(x1,y1),(x2,y2)</box> 格式
-        # 格式: 1. 设备类型\n   - 状态：...\n   - 位置：<box>...</box>
-        item_pattern = r'(\d+)\.\s*([^\n]+).*?(?:状态[：:]\s*([^\n]+))?.*?<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>'
+        # 按序号分割每个检测项
+        items = re.split(r'(?=\d+\.\s+)', response)
 
-        matches = re.findall(item_pattern, response, re.DOTALL)
-
-        for match in matches:
-            try:
-                category = match[1].strip()
-                status = match[2].strip() if match[2] else "正常"
-                x1, y1, x2, y2 = int(match[3]), int(match[4]), int(match[5]), int(match[6])
-
-                is_anomaly = any(kw in status for kw in ["异常", "全灭", "损坏", "故障", "破损", "不亮", "错误"])
-
-                detections.append({
-                    "category": category,
-                    "status": status,
-                    "is_anomaly": is_anomaly,
-                    "bbox": [x1, y1, x2, y2]
-                })
-            except (ValueError, IndexError):
+        for item in items:
+            if not item.strip():
                 continue
+
+            # 提取类别 (序号后面的第一行)
+            cat_match = re.match(r'(\d+)\.\s*([^\n]+)', item)
+            if not cat_match:
+                continue
+
+            category = cat_match.group(2).strip()
+
+            # 提取状态
+            status_match = re.search(r'状态[：:]\s*([^\n]+)', item)
+            status = status_match.group(1).strip() if status_match else "正常"
+
+            # 提取坐标
+            box_match = re.search(r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>', item)
+            if not box_match:
+                continue
+
+            x1, y1, x2, y2 = int(box_match.group(1)), int(box_match.group(2)), int(box_match.group(3)), int(box_match.group(4))
+
+            is_anomaly = any(kw in status for kw in ["异常", "全灭", "损坏", "故障", "破损", "不亮", "错误", "黑屏", "全亮"])
+
+            detections.append({
+                "category": category,
+                "status": status,
+                "is_anomaly": is_anomaly,
+                "bbox": [x1, y1, x2, y2]
+            })
 
         # 如果没匹配到完整格式，尝试只提取 box
         if not detections:
@@ -632,6 +653,7 @@ class GRPOTrainer:
         self.model.train()
         accumulated_steps = 0
         epoch_stats = []
+        total_samples = 0  # 记录处理的总样本数
 
         for epoch in range(self.config.num_epochs):
             logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs}")
@@ -652,6 +674,11 @@ class GRPOTrainer:
                     stats = self.grpo_step(image, prompt, ground_truth)
                     batch_stats.append(stats)
                     accumulated_steps += 1
+                    total_samples += 1
+
+                    # 按样本数保存检查点
+                    if total_samples % self.config.save_steps == 0:
+                        self.save_checkpoint(f"checkpoint-samples-{total_samples}")
 
                 # 记录 batch 平均统计
                 avg_stats = {
@@ -676,21 +703,19 @@ class GRPOTrainer:
 
                     # 日志
                     if self.global_step % self.config.logging_steps == 0:
-                        avg_loss = sum(s["loss"] for s in epoch_stats[-self.config.logging_steps:]) / self.config.logging_steps
-                        avg_reward = sum(s["mean_reward"] for s in epoch_stats[-self.config.logging_steps:]) / self.config.logging_steps
+                        recent_stats = epoch_stats[-self.config.logging_steps*self.config.gradient_accumulation_steps:]
+                        avg_loss = sum(s["loss"] for s in recent_stats) / len(recent_stats) if recent_stats else 0
+                        avg_reward = sum(s["mean_reward"] for s in recent_stats) / len(recent_stats) if recent_stats else 0
                         logger.info(
-                            f"Step {self.global_step}: loss={avg_loss:.4f}, "
+                            f"Step {self.global_step} (samples: {total_samples}): loss={avg_loss:.4f}, "
                             f"mean_reward={avg_reward:.4f}"
                         )
-
-                    # 保存检查点
-                    if self.global_step % self.config.save_steps == 0:
-                        self.save_checkpoint(f"checkpoint-{self.global_step}")
 
                 # 更新进度条
                 pbar.set_postfix({
                     "loss": f"{avg_stats['loss']:.4f}",
                     "reward": f"{avg_stats['mean_reward']:.4f}",
+                    "samples": total_samples,
                 })
 
         # 保存最终模型
@@ -716,7 +741,7 @@ class GRPOTrainer:
 
 def create_model_and_processor(config: GRPOConfig):
     """创建模型和处理器"""
-    logger.info(f"Loading model from {config.model_path}")
+    logger.info(f"Loading base model from {config.model_path}")
 
     model_class = get_model_class(config.model_path)
     logger.info(f"Using model class: {model_class.__name__}")
@@ -733,7 +758,7 @@ def create_model_and_processor(config: GRPOConfig):
     elif config.use_8bit:
         bnb_config = BitsAndBytesConfig(load_in_8bit=True)
 
-    # 加载模型
+    # 加载基础模型
     model = model_class.from_pretrained(
         config.model_path,
         quantization_config=bnb_config,
@@ -752,18 +777,31 @@ def create_model_and_processor(config: GRPOConfig):
     if config.use_4bit or config.use_8bit:
         model = prepare_model_for_kbit_training(model)
 
-    # 配置 LoRA
-    lora_config = LoraConfig(
-        r=config.lora_r,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        target_modules=config.lora_target_modules,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-    )
+    # 如果提供了 SFT 模型路径，先加载 SFT 的 LoRA 权重
+    if config.sft_model_path and os.path.exists(config.sft_model_path):
+        from peft import PeftModel
+        logger.info(f"Loading SFT LoRA weights from {config.sft_model_path}")
 
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+        # 加载 SFT LoRA 权重
+        model = PeftModel.from_pretrained(model, config.sft_model_path, is_trainable=True)
+        logger.info("SFT LoRA weights loaded, continuing GRPO training on top of SFT")
+
+        # 打印可训练参数
+        model.print_trainable_parameters()
+    else:
+        # 从头开始配置 LoRA
+        logger.info("No SFT model provided, starting GRPO from base model")
+        lora_config = LoraConfig(
+            r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            target_modules=config.lora_target_modules,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
 
     return model, processor
 
@@ -792,6 +830,14 @@ def create_reference_model(config: GRPOConfig):
         trust_remote_code=True,
     )
 
+    # 如果提供了 SFT 模型路径，参考模型也需要加载 SFT 权重
+    if config.sft_model_path and os.path.exists(config.sft_model_path):
+        from peft import PeftModel
+        logger.info(f"Loading SFT LoRA weights for reference model from {config.sft_model_path}")
+        ref_model = PeftModel.from_pretrained(ref_model, config.sft_model_path)
+        ref_model = ref_model.merge_and_unload()  # 合并权重以提高推理速度
+        logger.info("Reference model: SFT weights merged")
+
     # 冻结参考模型
     ref_model.eval()
     for param in ref_model.parameters():
@@ -805,6 +851,8 @@ def main():
 
     # Model arguments
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-VL-2B-Instruct")
+    parser.add_argument("--sft_model_path", type=str, default="",
+                        help="Path to SFT fine-tuned LoRA model (optional, for continuing from SFT)")
     parser.add_argument("--use_4bit", action="store_true", default=True)
     parser.add_argument("--use_8bit", action="store_true")
 
@@ -843,6 +891,7 @@ def main():
     # 创建配置
     config = GRPOConfig(
         model_path=args.model_path,
+        sft_model_path=args.sft_model_path,
         use_4bit=args.use_4bit and not args.use_8bit,
         use_8bit=args.use_8bit,
         lora_r=args.lora_r,

@@ -1,0 +1,83 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Model cache and weights
+model_cache/
+*.bin
+*.safetensors
+*.gguf
+
+# Training outputs
+outputs/
+checkpoints/
+runs/
+wandb/
+model_cache/
+
+# Data (keep structure, ignore large files)
+data/**/images/
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.png
+data/**/*.JPG
+data/**/*.JPEG
+data/**/*.PNG
+!data/**/*.json
+!data/**/*.txt
+
+# Generated DPO data
+data/dpo_data/
+
+# Environment files
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.project
+.pydevproject
+
+# Logs
+*.log
+logs/
+
+# Test outputs
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# CUDA
+*.cubin
+*.fatbin
+
+# Profiling
+*.prof
+*.lprof

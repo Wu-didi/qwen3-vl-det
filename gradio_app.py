@@ -1,6 +1,7 @@
 """Gradio web interface for traffic equipment anomaly detection."""
 
 import json
+import os
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
 
@@ -9,12 +10,50 @@ _model = None
 _processor = None
 _current_model_name = None
 
-# 可用模型列表
-AVAILABLE_MODELS = {
+# 基础模型列表
+BASE_MODELS = {
     "Qwen3-VL-2B": "./model_cache/Qwen/Qwen3-VL-2B-Instruct",
+    "Qwen3-VL-4B": "./model_cache/Qwen/Qwen3-VL-4B-Instruct",
     "Qwen3-VL-8B": "./model_cache/Qwen/Qwen3-VL-8B-Instruct",
     "Qwen2.5-VL-7B": "./model_cache/Qwen/Qwen2.5-VL-7B-Instruct",
 }
+
+# 微调模型目录
+FINETUNED_MODELS_DIR = "./outputs"
+
+
+def scan_finetuned_models() -> dict:
+    """扫描 outputs 目录下的微调模型"""
+    finetuned_models = {}
+
+    if not os.path.exists(FINETUNED_MODELS_DIR):
+        return finetuned_models
+
+    for name in os.listdir(FINETUNED_MODELS_DIR):
+        model_path = os.path.join(FINETUNED_MODELS_DIR, name)
+        config_path = os.path.join(model_path, "finetune_config.json")
+        adapter_config_path = os.path.join(model_path, "adapter_config.json")
+
+        # 检查是否有 LoRA 配置文件
+        if os.path.isdir(model_path) and (
+            os.path.exists(config_path) or os.path.exists(adapter_config_path)
+        ):
+            # 使用 🔧 标识微调模型
+            display_name = f"🔧 {name} (LoRA)"
+            finetuned_models[display_name] = model_path
+
+    return finetuned_models
+
+
+def get_available_models() -> dict:
+    """获取所有可用模型（基础模型 + 微调模型）"""
+    models = BASE_MODELS.copy()
+    models.update(scan_finetuned_models())
+    return models
+
+
+# 可用模型列表（动态扫描）
+AVAILABLE_MODELS = get_available_models()
 
 # 类别颜色
 CATEGORY_COLORS = {
@@ -36,12 +75,57 @@ CATEGORY_NAMES = {
 }
 
 
+def is_finetuned_model(model_choice: str) -> bool:
+    """判断是否为微调模型"""
+    return model_choice.startswith("🔧")
+
+
+def get_base_model_path(finetuned_path: str) -> str:
+    """从微调模型配置中获取基础模型路径"""
+    config_path = os.path.join(finetuned_path, "finetune_config.json")
+
+    if os.path.exists(config_path):
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+                return config.get("model_path", "./model_cache/Qwen/Qwen3-VL-2B-Instruct")
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # 尝试从 adapter_config.json 读取
+    adapter_config_path = os.path.join(finetuned_path, "adapter_config.json")
+    if os.path.exists(adapter_config_path):
+        try:
+            with open(adapter_config_path) as f:
+                config = json.load(f)
+                return config.get("base_model_name_or_path", "./model_cache/Qwen/Qwen3-VL-2B-Instruct")
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    return "./model_cache/Qwen/Qwen3-VL-2B-Instruct"
+
+
+def get_model_class(model_path: str):
+    """根据模型路径返回对应的模型类"""
+    from transformers import Qwen3VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration
+
+    model_path_lower = model_path.lower()
+    if "qwen3" in model_path_lower:
+        return Qwen3VLForConditionalGeneration
+    else:
+        return Qwen2_5_VLForConditionalGeneration
+
+
 def load_model(model_choice: str) -> str:
-    """加载选定的模型"""
+    """加载选定的模型（支持基础模型和微调模型）"""
     global _model, _processor, _current_model_name
 
     import torch
-    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration
+    from transformers import AutoProcessor
+
+    # 刷新模型列表
+    global AVAILABLE_MODELS
+    AVAILABLE_MODELS = get_available_models()
 
     if model_choice not in AVAILABLE_MODELS:
         return f"❌ 未知模型: {model_choice}"
@@ -61,25 +145,50 @@ def load_model(model_choice: str) -> str:
         torch.cuda.empty_cache()
 
     try:
-        # 加载 processor
-        _processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        if is_finetuned_model(model_choice):
+            # 加载微调模型
+            from peft import PeftModel
 
-        # 根据模型类型选择类
-        if "qwen3-vl" in model_path.lower():
-            model_class = Qwen3VLForConditionalGeneration
+            base_model_path = get_base_model_path(model_path)
+            print(f"Loading base model from: {base_model_path}")
+            print(f"Loading LoRA weights from: {model_path}")
+
+            # 加载基础模型
+            model_class = get_model_class(base_model_path)
+            base_model = model_class.from_pretrained(
+                base_model_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+
+            # 加载 LoRA 权重并合并
+            _model = PeftModel.from_pretrained(base_model, model_path)
+            _model = _model.merge_and_unload()
+
+            # 优先从微调模型加载 processor，失败则从基础模型加载
+            try:
+                _processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+            except Exception:
+                _processor = AutoProcessor.from_pretrained(base_model_path, trust_remote_code=True)
+
+            _current_model_name = model_choice
+            return f"✅ 微调模型 {model_choice} 加载成功！\n   基础模型: {base_model_path}"
+
         else:
-            model_class = Qwen2_5_VLForConditionalGeneration
+            # 加载基础模型
+            model_class = get_model_class(model_path)
+            _processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
-        # 加载模型
-        _model = model_class.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
+            _model = model_class.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
 
-        _current_model_name = model_choice
-        return f"✅ 模型 {model_choice} 加载成功！"
+            _current_model_name = model_choice
+            return f"✅ 模型 {model_choice} 加载成功！"
 
     except Exception as e:
         _model = None
@@ -91,8 +200,75 @@ def load_model(model_choice: str) -> str:
 def get_model_status() -> str:
     """获取当前模型状态"""
     if _current_model_name:
+        if is_finetuned_model(_current_model_name):
+            return f"当前模型: {_current_model_name} (微调)"
         return f"当前模型: {_current_model_name}"
     return "未加载模型"
+
+
+def refresh_model_list():
+    """刷新模型列表"""
+    global AVAILABLE_MODELS
+    AVAILABLE_MODELS = get_available_models()
+    choices = list(AVAILABLE_MODELS.keys())
+    return gr.update(choices=choices)
+
+
+def parse_box_format(text: str) -> dict:
+    """
+    解析 <box>(x1,y1),(x2,y2)</box> 格式的检测结果
+    返回与 JSON 格式兼容的结构
+    """
+    import re
+    detections = []
+
+    # 按序号分割每个检测项
+    items = re.split(r'(?=\d+\.\s+)', text)
+
+    for item in items:
+        if not item.strip():
+            continue
+
+        # 提取类别 (序号后面的第一行)
+        cat_match = re.match(r'(\d+)\.\s*([^\n]+)', item)
+        if not cat_match:
+            continue
+
+        category = cat_match.group(2).strip()
+
+        # 提取状态
+        status_match = re.search(r'状态[：:]\s*([^\n]+)', item)
+        status = status_match.group(1).strip() if status_match else "正常"
+
+        # 提取原因
+        reason_match = re.search(r'原因[：:]\s*([^\n]+)', item)
+        reason = reason_match.group(1).strip() if reason_match else ""
+
+        # 提取坐标
+        box_match = re.search(r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>', item)
+        if not box_match:
+            continue
+
+        x1, y1, x2, y2 = int(box_match.group(1)), int(box_match.group(2)), int(box_match.group(3)), int(box_match.group(4))
+
+        # 判断是否异常
+        is_anomaly = any(kw in status for kw in ["异常", "全灭", "损坏", "故障", "破损", "不亮", "错误", "黑屏", "全亮"])
+
+        detections.append({
+            "category": category,
+            "anomaly_type": status,
+            "confidence": 0.9 if is_anomaly else 0.8,
+            "bbox": [x1, y1, x2, y2],
+            "description": reason if reason else status,
+        })
+
+    has_anomaly = any("异常" in d.get("anomaly_type", "") for d in detections)
+
+    return {
+        "has_anomaly": has_anomaly,
+        "detections": detections,
+        "summary": f"检测到 {len(detections)} 个目标" + ("，存在异常" if has_anomaly else "，均正常")
+    }
 
 
 def draw_detections_on_image(image: Image.Image, detections: list, has_anomaly: bool) -> Image.Image:
@@ -204,22 +380,32 @@ def detect(image: Image.Image, prompt: str) -> tuple[Image.Image | None, str, st
     output_ids_trimmed = output_ids[0][inputs.input_ids.shape[1]:]
     result_text = _processor.decode(output_ids_trimmed, skip_special_tokens=True)
 
-    # 解析 JSON
+    # 尝试解析结果 (支持两种格式)
     json_data = None
+
+    # 1. 先尝试解析 JSON 格式
     patterns = [r"```json\s*([\s\S]*?)\s*```", r"```\s*([\s\S]*?)\s*```", r"\{[\s\S]*\}"]
     for pattern in patterns:
         matches = re.findall(pattern, result_text)
         for match in matches:
             try:
-                json_data = json.loads(match)
-                break
+                parsed = json.loads(match)
+                # 确保是字典格式
+                if isinstance(parsed, dict):
+                    json_data = parsed
+                    break
             except:
                 continue
         if json_data:
             break
 
-    if not json_data:
-        return None, result_text, "无法解析检测结果"
+    # 2. 如果 JSON 解析失败，尝试解析 <box> 格式 (微调模型输出)
+    if not json_data and "<box>" in result_text:
+        json_data = parse_box_format(result_text)
+
+    # 3. 如果都失败，返回原始文本
+    if not json_data or not json_data.get("detections"):
+        return None, result_text, "无法解析检测结果，原始输出如上"
 
     # 绘制检测框
     has_anomaly = json_data.get("has_anomaly", False)
@@ -246,8 +432,8 @@ def detect(image: Image.Image, prompt: str) -> tuple[Image.Image | None, str, st
     return annotated_image, json_str, summary
 
 
-# 默认检测 prompt
-DEFAULT_PROMPT = """请检测图片中的交通设备异常，包括：交通标志、信号灯、道路设施、诱导屏、限高架、机柜等。
+# 默认检测 prompt (JSON 格式 - 适合基础模型)
+DEFAULT_PROMPT_JSON = """请检测图片中的交通设备异常，包括：交通标志、信号灯、道路设施、诱导屏、限高架、机柜等。
 
 以JSON格式输出：
 ```json
@@ -268,21 +454,37 @@ DEFAULT_PROMPT = """请检测图片中的交通设备异常，包括：交通标
 
 bbox为像素坐标，请确保边界框紧密包围目标。"""
 
+# 微调模型 prompt (box 格式 - 适合 LoRA 微调模型)
+DEFAULT_PROMPT_BOX = """请检测图像中的交通设备。需要检测的设备类型包括：交通信号灯、交通诱导屏、限高架、机柜、背包箱。
+
+请按以下格式输出每个检测到的设备：
+1. 设备类型
+2. 状态（正常/异常状态）
+3. 如果异常，说明可能的原因
+4. 位置坐标：<box>(x1,y1),(x2,y2)</box>（坐标范围0-1000）
+
+如果没有检测到任何设备，请回复"未检测到相关设备"。"""
+
+# 默认使用微调模型的 prompt
+DEFAULT_PROMPT = DEFAULT_PROMPT_BOX
+
 
 # 构建界面
 with gr.Blocks(title="交通设备异常检测", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🚦 交通设备异常检测系统\n基于 Qwen3-VL 视觉语言模型")
+    gr.Markdown("# 🚦 交通设备异常检测系统\n基于 Qwen-VL 视觉语言模型（支持基础模型和 LoRA 微调模型）")
 
     # 模型加载区
     with gr.Row():
         with gr.Column(scale=2):
             model_dropdown = gr.Dropdown(
                 choices=list(AVAILABLE_MODELS.keys()),
-                value="Qwen3-VL-8B",
-                label="选择模型",
+                value=list(AVAILABLE_MODELS.keys())[0] if AVAILABLE_MODELS else None,
+                label="选择模型（🔧 表示微调模型）",
             )
         with gr.Column(scale=1):
-            load_btn = gr.Button("🔄 加载模型", variant="primary")
+            with gr.Row():
+                refresh_btn = gr.Button("🔄 刷新列表", variant="secondary", size="sm")
+                load_btn = gr.Button("📥 加载模型", variant="primary")
         with gr.Column(scale=2):
             model_status = gr.Textbox(label="模型状态", value="未加载模型", interactive=False)
 
@@ -305,6 +507,12 @@ with gr.Blocks(title="交通设备异常检测", theme=gr.themes.Soft()) as demo
             json_output = gr.Code(label="JSON 结果", language="json", lines=10)
 
     # 事件绑定
+    refresh_btn.click(
+        fn=refresh_model_list,
+        inputs=[],
+        outputs=[model_dropdown],
+    )
+
     load_btn.click(
         fn=load_model,
         inputs=[model_dropdown],
