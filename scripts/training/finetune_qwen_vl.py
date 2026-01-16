@@ -13,6 +13,7 @@ Usage:
 """
 
 import os
+import re
 import json
 import argparse
 import logging
@@ -122,62 +123,96 @@ class TrafficAnomalyDataset(Dataset):
         return len(self.data)
 
     def _find_assistant_start(self, input_ids: torch.Tensor) -> int:
-        """找到 assistant 回复开始的位置"""
-        # Qwen-VL 的 assistant 标记通常是 <|im_start|>assistant
-        # 我们需要找到最后一个 assistant 标记的位置
+        """找到 assistant 回复开始的位置（改进版）"""
         tokenizer = self.processor.tokenizer
+        input_ids_list = input_ids.tolist() if input_ids.dim() == 1 else input_ids[0].tolist()
 
-        # 尝试多种可能的 assistant 标记
-        assistant_tokens_candidates = [
-            "assistant",
-            "<|im_start|>assistant",
-            "Assistant",
-        ]
+        # 方法1: 使用 <|im_start|> 特殊 token（最可靠）
+        # Qwen-VL 格式: <|im_start|>user\n...<|im_end|><|im_start|>assistant\n...
+        try:
+            im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+            if im_start_id is not None and im_start_id != tokenizer.unk_token_id:
+                # 找到所有 <|im_start|> 的位置
+                positions = [i for i, x in enumerate(input_ids_list) if x == im_start_id]
 
-        input_ids_list = input_ids.tolist()
+                if len(positions) >= 2:
+                    # 最后一个 <|im_start|> 应该是 assistant 的开始
+                    last_start = positions[-1]
 
-        # 方法1: 查找 "assistant" 文本对应的 token 序列
-        for candidate in assistant_tokens_candidates:
-            try:
-                candidate_ids = tokenizer.encode(candidate, add_special_tokens=False)
-                # 在 input_ids 中查找这个序列
-                for i in range(len(input_ids_list) - len(candidate_ids) + 1):
-                    if input_ids_list[i:i+len(candidate_ids)] == candidate_ids:
-                        # 返回 assistant 标记之后的位置
-                        return i + len(candidate_ids)
-            except Exception:
-                continue
+                    # 向后查找，跳过 "assistant\n" 部分
+                    # 通常是: <|im_start|> + assistant_token + \n
+                    for offset in range(1, min(8, len(input_ids_list) - last_start)):
+                        idx = last_start + offset
+                        token_text = tokenizer.decode([input_ids_list[idx]], skip_special_tokens=False)
+                        # 找到换行符后就是真正的回复开始
+                        if '\n' in token_text:
+                            return idx + 1
 
-        # 方法2: 使用特殊 token ID
-        # Qwen 模型通常使用 <|im_start|> 和 <|im_end|> 作为消息边界
-        im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-        if im_start_id is not None and im_start_id != tokenizer.unk_token_id:
-            # 找到倒数第二个 <|im_start|>（最后一个是 assistant 的开始）
-            positions = [i for i, x in enumerate(input_ids_list) if x == im_start_id]
-            if len(positions) >= 1:
-                # 最后一个 <|im_start|> 后面应该是 assistant
-                last_start = positions[-1]
-                # 跳过 <|im_start|>assistant\n
-                # 通常格式是 <|im_start|>assistant\n 内容 <|im_end|>
-                for i in range(last_start + 1, min(last_start + 10, len(input_ids_list))):
-                    # 找到换行符后的位置
-                    token_text = tokenizer.decode([input_ids_list[i]])
-                    if '\n' in token_text:
-                        return i + 1
-                return last_start + 3  # 默认跳过几个 token
+                    # 如果没找到换行符，使用默认偏移（通常是3-4个token）
+                    return last_start + 3
+        except Exception as e:
+            logger.debug(f"Method 1 failed: {e}")
 
-        # 方法3: 回退策略 - 假设前 60% 是 prompt
-        return int(len(input_ids_list) * 0.6)
+        # 方法2: 搜索 "assistant" token 序列
+        try:
+            # 编码 "<|im_start|>assistant\n"
+            assistant_prompt = "<|im_start|>assistant\n"
+            assistant_ids = tokenizer.encode(assistant_prompt, add_special_tokens=False)
+
+            # 在序列中查找
+            for i in range(len(input_ids_list) - len(assistant_ids) + 1):
+                if input_ids_list[i:i+len(assistant_ids)] == assistant_ids:
+                    return i + len(assistant_ids)
+        except Exception as e:
+            logger.debug(f"Method 2 failed: {e}")
+
+        # 方法3: 解码整个序列查找文本标记（最后的回退）
+        try:
+            full_text = tokenizer.decode(input_ids_list, skip_special_tokens=False)
+            # 查找最后一个 "assistant" 出现的位置
+            assistant_positions = [m.start() for m in re.finditer(r'assistant\s*\n', full_text)]
+
+            if assistant_positions:
+                # 找到这个文本位置对应的 token 位置
+                last_assistant_text_pos = assistant_positions[-1]
+
+                # 重新编码到 text_pos 为止，计算 token 数量
+                prefix_text = full_text[:last_assistant_text_pos]
+                prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+
+                # 跳过 "assistant\n" 部分（大约2-3个token）
+                return len(prefix_ids) + 3
+        except Exception as e:
+            logger.debug(f"Method 3 failed: {e}")
+
+        # 最后的回退：假设前半部分是 prompt
+        # 但给出警告，因为这可能不准确
+        fallback_pos = int(len(input_ids_list) * 0.5)
+        logger.warning(
+            f"Failed to find assistant start position accurately, using fallback: {fallback_pos}. "
+            f"This may affect training quality. Sequence length: {len(input_ids_list)}"
+        )
+        return fallback_pos
 
     def __getitem__(self, idx) -> Dict[str, Any]:
         item = self.data[idx]
+
+        # ✅ 数据格式验证
+        if "image" not in item:
+            raise ValueError(f"Sample {idx}: missing 'image' field")
+        if "conversations" not in item:
+            raise ValueError(f"Sample {idx}: missing 'conversations' field")
+        if len(item["conversations"]) < 2:
+            raise ValueError(f"Sample {idx}: conversations must have at least 2 messages (user + assistant)")
 
         # Get image path and conversations
         image_path = item["image"]
         conversations = item["conversations"]
 
-        # Load image
+        # Load image with validation
         try:
+            if not os.path.exists(image_path):
+                raise FileNotFoundError(f"Image not found: {image_path}")
             image = Image.open(image_path).convert("RGB")
             # 限制图片大小以减少显存占用 (Qwen-VL 图片 token 很多)
             if self.max_image_size and max(image.size) > self.max_image_size:
@@ -185,9 +220,8 @@ class TrafficAnomalyDataset(Dataset):
                 new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
                 image = image.resize(new_size, Image.LANCZOS)
         except Exception as e:
-            logger.warning(f"Failed to load image {image_path}: {e}")
-            # Return a placeholder if image fails to load
-            image = Image.new("RGB", (224, 224), color="white")
+            # 图片加载失败时抛出异常而不是静默使用占位图
+            raise RuntimeError(f"Sample {idx}: Failed to load image {image_path}: {e}")
 
         # Extract user and assistant messages
         user_msg = conversations[0]["value"]

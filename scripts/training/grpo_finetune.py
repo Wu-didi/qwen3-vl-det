@@ -430,6 +430,7 @@ class GRPOTrainer:
         processor,
         config: GRPOConfig,
         reward_calculator: RewardCalculator,
+        total_steps: int,  # ✅ 新增：用于计算 warmup
     ):
         self.model = model
         self.ref_model = ref_model  # 参考模型（frozen）
@@ -443,6 +444,16 @@ class GRPOTrainer:
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
         )
+
+        # ✅ 新增：Warmup scheduler
+        warmup_steps = int(total_steps * config.warmup_ratio)
+        self.scheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer,
+            start_factor=0.1,  # 从 10% 学习率开始
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        logger.info(f"Warmup scheduler: {warmup_steps} steps (ratio={config.warmup_ratio})")
 
         self.global_step = 0
 
@@ -505,6 +516,41 @@ class GRPOTrainer:
 
         return responses
 
+    def _find_assistant_start(self, input_ids: torch.Tensor) -> int:
+        """找到 assistant 回复开始的位置（与 SFT 相同的改进逻辑）"""
+        tokenizer = self.processor.tokenizer
+        input_ids_list = input_ids.tolist() if input_ids.dim() == 1 else input_ids[0].tolist()
+
+        # 方法1: 使用 <|im_start|> 特殊 token
+        try:
+            im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+            if im_start_id is not None and im_start_id != tokenizer.unk_token_id:
+                positions = [i for i, x in enumerate(input_ids_list) if x == im_start_id]
+
+                if len(positions) >= 2:
+                    last_start = positions[-1]
+                    for offset in range(1, min(8, len(input_ids_list) - last_start)):
+                        idx = last_start + offset
+                        token_text = tokenizer.decode([input_ids_list[idx]], skip_special_tokens=False)
+                        if '\n' in token_text:
+                            return idx + 1
+                    return last_start + 3
+        except Exception:
+            pass
+
+        # 方法2: 搜索完整的 assistant prompt
+        try:
+            assistant_prompt = "<|im_start|>assistant\n"
+            assistant_ids = tokenizer.encode(assistant_prompt, add_special_tokens=False)
+            for i in range(len(input_ids_list) - len(assistant_ids) + 1):
+                if input_ids_list[i:i+len(assistant_ids)] == assistant_ids:
+                    return i + len(assistant_ids)
+        except Exception:
+            pass
+
+        # 回退策略
+        return int(len(input_ids_list) * 0.5)
+
     def compute_log_probs(
         self,
         model,
@@ -512,7 +558,7 @@ class GRPOTrainer:
         prompt: str,
         response: str,
     ) -> torch.Tensor:
-        """计算给定响应的 log 概率"""
+        """计算给定响应的 log 概率（修复版：正确 mask prompt + 返回总和）"""
         messages = [
             {
                 "role": "user",
@@ -540,14 +586,34 @@ class GRPOTrainer:
             images=[image],
             return_tensors="pt",
             padding=True,
-            truncation=False,  # 不截断，避免图像 token 丢失
+            truncation=False,
         ).to(model.device)
 
-        # Forward pass
-        outputs = model(**inputs, labels=inputs["input_ids"])
+        # ✅ 关键修复1: 创建 labels 并 mask prompt 部分
+        labels = inputs["input_ids"].clone()
 
-        # 返回平均 log 概率
-        return -outputs.loss  # loss 是负 log likelihood
+        # 找到 assistant 开始位置
+        assistant_start = self._find_assistant_start(inputs["input_ids"][0])
+
+        # Mask prompt 部分（只训练 assistant 的回复）
+        labels[0, :assistant_start] = -100
+
+        # Mask padding tokens
+        pad_token_id = self.processor.tokenizer.pad_token_id
+        if pad_token_id is not None:
+            labels[labels == pad_token_id] = -100
+
+        # Forward pass
+        outputs = model(**inputs, labels=labels)
+
+        # ✅ 关键修复2: 计算有效 token 数量并返回总 log prob
+        valid_tokens = (labels != -100).sum().float()
+
+        # outputs.loss 是平均 negative log likelihood
+        # 我们需要总的 log probability
+        total_log_prob = -outputs.loss * valid_tokens
+
+        return total_log_prob
 
     def grpo_step(
         self,
@@ -555,7 +621,7 @@ class GRPOTrainer:
         prompt: str,
         ground_truth: Dict,
     ) -> Dict[str, float]:
-        """执行单个 GRPO 更新步骤"""
+        """执行单个 GRPO 更新步骤（修复版：添加 PPO clipping）"""
         step_start = time.time()
 
         # 1. 生成多个响应
@@ -578,36 +644,69 @@ class GRPOTrainer:
         rewards = torch.tensor(rewards, device=self.model.device)
 
         # 3. 计算组内相对优势 (Group Relative Advantage)
-        # A_i = (r_i - mean(r)) / (std(r) + eps)
         mean_reward = rewards.mean()
         std_reward = rewards.std() + 1e-8
         advantages = (rewards - mean_reward) / std_reward
 
-        # 4. 计算策略损失
+        # ✅ 修复1: 先计算所有响应的初始 log probs（用于 PPO clipping）
         logprob_start = time.time()
+        with torch.no_grad():
+            old_log_probs = []
+            ref_log_probs = []
+            for response in responses:
+                # 当前策略的初始 log prob
+                old_log_prob = self.compute_log_probs(
+                    self.model, image, prompt, response
+                )
+                old_log_probs.append(old_log_prob)
+
+                # 参考策略的 log prob
+                ref_log_prob = self.compute_log_probs(
+                    self.ref_model, image, prompt, response
+                )
+                ref_log_probs.append(ref_log_prob)
+
+        # 4. 计算策略损失（带 PPO clipping）
         total_loss = 0.0
+        kl_divs = []
+
         for i, (response, advantage) in enumerate(zip(responses, advantages)):
-            # 当前策略的 log 概率
+            # 当前策略的 log 概率（可训练）
             log_prob = self.compute_log_probs(
                 self.model, image, prompt, response
             )
 
-            # 参考策略的 log 概率 (for KL penalty)
-            with torch.no_grad():
-                ref_log_prob = self.compute_log_probs(
-                    self.ref_model, image, prompt, response
-                )
+            # ✅ 修复2: 计算 importance ratio
+            old_log_prob = old_log_probs[i]
+            ratio = torch.exp(log_prob - old_log_prob)
 
-            # KL 散度惩罚
+            # ✅ 修复3: PPO clipping
+            clip_range = self.config.clip_range
+            clipped_ratio = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+
+            # PPO 损失：取 min 以限制更新幅度
+            # 当 advantage > 0: 限制 ratio 不超过 1+clip（防止过度增大概率）
+            # 当 advantage < 0: 限制 ratio 不低于 1-clip（防止过度减小概率）
+            surr1 = ratio * advantage
+            surr2 = clipped_ratio * advantage
+            policy_loss = -torch.min(surr1, surr2)  # ✅ 使用 min，加负号变成损失
+
+            # ✅ 修复4: KL 散度惩罚（相对于参考模型）
+            ref_log_prob = ref_log_probs[i]
             kl_div = log_prob - ref_log_prob
+            kl_divs.append(kl_div.item())
 
-            # GRPO 损失: -advantage * log_prob + kl_coef * kl_div
-            loss = -advantage * log_prob + self.config.kl_coef * kl_div
+            # 总损失 = 策略损失 + KL 惩罚
+            loss = policy_loss + self.config.kl_coef * kl_div
             total_loss = total_loss + loss
+
         logprob_time = time.time() - logprob_start
 
         # 平均损失
         total_loss = total_loss / self.config.num_generations
+
+        # ✅ 新增：梯度累积损失缩放
+        total_loss = total_loss / self.config.gradient_accumulation_steps
 
         # 5. 反向传播
         backward_start = time.time()
@@ -628,10 +727,11 @@ class GRPOTrainer:
             "std_reward": std_reward.item(),
             "max_reward": rewards.max().item(),
             "min_reward": rewards.min().item(),
+            "mean_kl": sum(kl_divs) / len(kl_divs),
         }
 
     def train(self, dataset: GRPODataset):
-        """训练循环"""
+        """训练循环（修复版：正确的梯度累积顺序）"""
         logger.info("Starting GRPO training...")
 
         # 自定义 collate_fn，保留 PIL Image 不做转换
@@ -653,7 +753,10 @@ class GRPOTrainer:
         self.model.train()
         accumulated_steps = 0
         epoch_stats = []
-        total_samples = 0  # 记录处理的总样本数
+        total_samples = 0
+
+        # ✅ 修复: 在训练开始前 zero_grad
+        self.optimizer.zero_grad()
 
         for epoch in range(self.config.num_epochs):
             logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs}")
@@ -670,7 +773,7 @@ class GRPOTrainer:
                     prompt = batch["prompt"][i]
                     ground_truth = batch["ground_truth"][i]
 
-                    # GRPO step
+                    # GRPO step（会调用 backward）
                     stats = self.grpo_step(image, prompt, ground_truth)
                     batch_stats.append(stats)
                     accumulated_steps += 1
@@ -684,37 +787,57 @@ class GRPOTrainer:
                 avg_stats = {
                     "loss": sum(s["loss"] for s in batch_stats) / len(batch_stats),
                     "mean_reward": sum(s["mean_reward"] for s in batch_stats) / len(batch_stats),
+                    "mean_kl": sum(s.get("mean_kl", 0) for s in batch_stats) / len(batch_stats),
                 }
                 epoch_stats.append(avg_stats)
 
                 if batch_idx == 0:
-                    logger.info(f"First batch completed: loss={avg_stats['loss']:.4f}, reward={avg_stats['mean_reward']:.4f}")
+                    logger.info(
+                        f"First batch completed: loss={avg_stats['loss']:.4f}, "
+                        f"reward={avg_stats['mean_reward']:.4f}, kl={avg_stats['mean_kl']:.4f}"
+                    )
 
-                # 梯度累积
+                # ✅ 修复: 梯度累积逻辑
                 if accumulated_steps % self.config.gradient_accumulation_steps == 0:
                     # 梯度裁剪
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         self.config.max_grad_norm
                     )
+
+                    # 执行优化步骤
                     self.optimizer.step()
+
+                    # ✅ 新增：更新学习率（warmup）
+                    self.scheduler.step()
+
+                    # ✅ 关键: step 后立即 zero_grad
                     self.optimizer.zero_grad()
+
                     self.global_step += 1
 
                     # 日志
                     if self.global_step % self.config.logging_steps == 0:
                         recent_stats = epoch_stats[-self.config.logging_steps*self.config.gradient_accumulation_steps:]
-                        avg_loss = sum(s["loss"] for s in recent_stats) / len(recent_stats) if recent_stats else 0
-                        avg_reward = sum(s["mean_reward"] for s in recent_stats) / len(recent_stats) if recent_stats else 0
-                        logger.info(
-                            f"Step {self.global_step} (samples: {total_samples}): loss={avg_loss:.4f}, "
-                            f"mean_reward={avg_reward:.4f}"
-                        )
+                        if recent_stats:
+                            avg_loss = sum(s["loss"] for s in recent_stats) / len(recent_stats)
+                            avg_reward = sum(s["mean_reward"] for s in recent_stats) / len(recent_stats)
+                            avg_kl = sum(s.get("mean_kl", 0) for s in recent_stats) / len(recent_stats)
+                            current_lr = self.scheduler.get_last_lr()[0]
+                            logger.info(
+                                f"Step {self.global_step} (samples: {total_samples}): "
+                                f"loss={avg_loss:.4f}, reward={avg_reward:.4f}, kl={avg_kl:.4f}, lr={current_lr:.2e}"
+                            )
+
+                    # 清理显存
+                    if self.global_step % 5 == 0:
+                        torch.cuda.empty_cache()
 
                 # 更新进度条
                 pbar.set_postfix({
                     "loss": f"{avg_stats['loss']:.4f}",
                     "reward": f"{avg_stats['mean_reward']:.4f}",
+                    "kl": f"{avg_stats['mean_kl']:.4f}",
                     "samples": total_samples,
                 })
 
@@ -931,6 +1054,11 @@ def main():
     # 创建数据集
     dataset = GRPODataset(config.train_data, processor, config.max_length, config.max_image_size)
 
+    # ✅ 计算总步数（用于 warmup scheduler）
+    total_samples = len(dataset) * config.num_epochs
+    total_steps = total_samples // config.gradient_accumulation_steps
+    logger.info(f"Total training steps: {total_steps} (samples: {total_samples})")
+
     # 创建奖励计算器
     reward_calculator = RewardCalculator(config)
 
@@ -941,6 +1069,7 @@ def main():
         processor=processor,
         config=config,
         reward_calculator=reward_calculator,
+        total_steps=total_steps,  # ✅ 传递 total_steps
     )
 
     # 开始训练
