@@ -152,6 +152,8 @@ def inference(
         text=[text],
         images=[image],
         padding=True,
+        truncation=True,  # Enable truncation for safety
+        max_length=2048,  # Reasonable default for inference
         return_tensors="pt",
     )
     inputs = inputs.to(model.device)

@@ -115,6 +115,8 @@ def detect_anomalies(
     inputs = processor(
         text=[text],
         images=[image],
+        truncation=True,  # Enable truncation for safety
+        max_length=2048,  # Reasonable default for inference
         return_tensors="pt",
     ).to(model.device)
 

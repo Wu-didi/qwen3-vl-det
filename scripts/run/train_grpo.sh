@@ -21,6 +21,7 @@ LEARNING_RATE=5e-6                # 学习率 (降低，原 1e-5)
 MODEL_PATH="./model_cache/Qwen/Qwen3-VL-2B-Instruct"
 SFT_MODEL_PATH="./outputs/qwen3vl_lora"   # SFT 微调后的模型路径 (留空则从基础模型开始)
 TRAIN_DATA="data/hefei_last_dataset/qwen_data/train.json"
+VAL_DATA="data/hefei_last_dataset/qwen_data/val.json"  # 验证集路径 (留空则不验证)
 OUTPUT_DIR="outputs/qwen3vl_grpo"
 
 #==========================================
@@ -35,8 +36,9 @@ KL_COEF=0.5                       # 增大 KL 系数，防止模型偏离太远 
 LORA_ALPHA=16
 LORA_DROPOUT=0.1
 MAX_LENGTH=2048
-USE_4BIT=true
+DISABLE_4BIT=false                # 设为 true 关闭 4bit (默认开启)
 SAVE_STEPS=200                    # 每处理多少个样本保存一次检查点
+EVAL_STEPS=200                    # 每多少步验证一次 (0 表示不验证)
 LOGGING_STEPS=10
 
 #==========================================
@@ -84,14 +86,19 @@ CMD="python scripts/training/grpo_finetune.py \
     --learning_rate $LEARNING_RATE \
     --max_length $MAX_LENGTH \
     --save_steps $SAVE_STEPS \
+    --eval_steps $EVAL_STEPS \
     --logging_steps $LOGGING_STEPS"
 
-if [ "$USE_4BIT" = "true" ]; then
-    CMD="$CMD --use_4bit"
+if [ "$DISABLE_4BIT" = "true" ]; then
+    CMD="$CMD --no_4bit"
 fi
 
 if [ -n "$SFT_MODEL_PATH" ]; then
     CMD="$CMD --sft_model_path $SFT_MODEL_PATH"
+fi
+
+if [ -n "$VAL_DATA" ] && [ -f "$VAL_DATA" ]; then
+    CMD="$CMD --val_data $VAL_DATA"
 fi
 
 echo ""

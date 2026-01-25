@@ -20,6 +20,7 @@ BETA=0.1                          # DPO 温度参数
 #==========================================
 MODEL_PATH="./model_cache/Qwen/Qwen3-VL-2B-Instruct"
 TRAIN_DATA="data/dpo_data/train.json"
+VAL_DATA="data/dpo_data/val.json"  # 验证集路径 (留空则不验证)
 OUTPUT_DIR="outputs/qwen3vl_dpo"
 
 #==========================================
@@ -28,8 +29,9 @@ OUTPUT_DIR="outputs/qwen3vl_dpo"
 LORA_ALPHA=16
 LORA_DROPOUT=0.1
 MAX_LENGTH=2048
-USE_4BIT=true
+DISABLE_4BIT=false                # 设为 true 关闭 4bit (默认开启)
 SAVE_STEPS=500
+EVAL_STEPS=500                    # 每多少步验证一次 (0 表示不验证)
 LOGGING_STEPS=10
 
 #==========================================
@@ -83,10 +85,15 @@ CMD="python scripts/training/dpo_finetune.py \
     --learning_rate $LEARNING_RATE \
     --max_length $MAX_LENGTH \
     --save_steps $SAVE_STEPS \
+    --eval_steps $EVAL_STEPS \
     --logging_steps $LOGGING_STEPS"
 
-if [ "$USE_4BIT" = "true" ]; then
-    CMD="$CMD --use_4bit"
+if [ "$DISABLE_4BIT" = "true" ]; then
+    CMD="$CMD --no_4bit"
+fi
+
+if [ -n "$VAL_DATA" ] && [ -f "$VAL_DATA" ]; then
+    CMD="$CMD --val_data $VAL_DATA"
 fi
 
 echo ""

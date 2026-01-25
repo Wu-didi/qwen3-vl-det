@@ -8,7 +8,8 @@ Usage:
     python scripts/finetune_qwen_vl.py \
         --model_path Qwen/Qwen3-VL-2B-Instruct \
         --train_data data/hefei_last_dataset/qwen_data/train.json \
-        --val_data data/hefei_last_dataset/qwen_data/val.json \
+        --val_data data/hefei_last_dataset/qwen_data/val.j
+        son \
         --output_dir outputs/qwen3vl_lora
 """
 
@@ -223,26 +224,47 @@ class TrafficAnomalyDataset(Dataset):
             # 图片加载失败时抛出异常而不是静默使用占位图
             raise RuntimeError(f"Sample {idx}: Failed to load image {image_path}: {e}")
 
-        # Extract user and assistant messages
-        user_msg = conversations[0]["value"]
-        assistant_msg = conversations[1]["value"]
+        # ✅ 修复：遍历所有 conversations，使用 from 字段映射 role
+        messages = []
+        first_user_msg = True
 
-        # Format as chat messages for Qwen-VL
-        messages = [
-            {
-                "role": "user",
-                "content": [
+        for conv in conversations:
+            # 获取角色（from 字段映射到 role）
+            role = conv.get("from", "user")  # 默认 user
+            # 标准化角色名称：human/user -> user, gpt/assistant -> assistant
+            if role in ["human", "user"]:
+                role = "user"
+            elif role in ["gpt", "assistant"]:
+                role = "assistant"
+            elif role == "system":
+                role = "system"
+            else:
+                logger.warning(f"Sample {idx}: unknown role '{role}', treating as user")
+                role = "user"
+
+            # 获取消息内容
+            text = conv.get("value", "")
+            # 移除文本中的 <image> 占位符（图片会单独处理）
+            text = text.replace("<image>\n", "").replace("<image>", "")
+
+            # 构造消息内容
+            if role == "user" and first_user_msg:
+                # 只在第一条 user 消息里添加图片
+                content = [
                     {"type": "image", "image": image},
-                    {"type": "text", "text": user_msg.replace("<image>\n", "").replace("<image>", "")},
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": assistant_msg},
-                ],
-            }
-        ]
+                    {"type": "text", "text": text},
+                ]
+                first_user_msg = False
+            else:
+                # 其他消息只有文本
+                content = [
+                    {"type": "text", "text": text},
+                ]
+
+            messages.append({
+                "role": role,
+                "content": content,
+            })
 
         # Process with Qwen-VL processor
         text = self.processor.apply_chat_template(
@@ -251,12 +273,13 @@ class TrafficAnomalyDataset(Dataset):
             add_generation_prompt=False
         )
 
-        # Tokenize
+        # Tokenize with proper truncation
         inputs = self.processor(
             text=[text],
             images=[image],
-            padding=True,
-            truncation=False,  # 不截断，避免图像 token 丢失
+            padding=False,  # Let collator handle padding
+            truncation=True,  # Enable truncation to prevent OOM
+            max_length=self.max_length,  # Use configured max_length
             return_tensors="pt",
         )
 
@@ -385,22 +408,20 @@ class VLDataCollator:
             elif key == "pixel_values":
                 # pixel_values 可能有不同的形状，需要特殊处理
                 # 通常形状是 [num_patches, channels, height, width]
-                # 如果所有样本的 patch 数量相同，可以直接 stack
-                # 否则需要 padding 或使用 list
-                try:
-                    batch[key] = torch.stack(values)
-                except RuntimeError:
-                    # 形状不一致，使用 concatenate 并记录边界
-                    batch[key] = torch.cat(values, dim=0)
-                    # 需要额外记录每个样本的 patch 数量
-                    batch["pixel_values_lengths"] = torch.tensor([v.shape[0] for v in values])
+                # 对于 Qwen-VL，始终使用 cat 拼接 patches
+                # 模型会通过 image_grid_thw 来理解如何分割
+                batch[key] = torch.cat(values, dim=0)
             elif key == "image_grid_thw":
                 # image_grid_thw 记录每个图像的网格信息
-                # 形状通常是 [num_images, 3]
-                try:
-                    batch[key] = torch.stack(values)
-                except RuntimeError:
-                    batch[key] = torch.cat(values, dim=0)
+                # 形状通常是 [num_images, 3]，batch 后应该是 (B, 3) 或 (total_images, 3)
+                # 优先使用 cat 而不是 stack，避免产生 (B, 1, 3) 这种错误形状
+                processed_values = []
+                for v in values:
+                    # 如果是 (3,) 形状，unsqueeze 到 (1, 3)
+                    if v.dim() == 1:
+                        v = v.unsqueeze(0)
+                    processed_values.append(v)
+                batch[key] = torch.cat(processed_values, dim=0)
             else:
                 # 其他张量尝试 stack
                 try:
@@ -502,9 +523,9 @@ def main():
     # Model arguments
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-VL-2B-Instruct",
                         help="Path to pretrained model")
-    parser.add_argument("--use_4bit", action="store_true", default=True,
-                        help="Use 4-bit quantization (QLoRA)")
-    parser.add_argument("--use_8bit", action="store_true",
+    parser.add_argument("--no_4bit", action="store_false", dest="use_4bit", default=True,
+                        help="Disable 4-bit quantization (QLoRA). Default: enabled")
+    parser.add_argument("--use_8bit", action="store_true", default=False,
                         help="Use 8-bit quantization")
 
     # LoRA arguments
@@ -550,10 +571,10 @@ def main():
     # Other arguments
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
-    parser.add_argument("--bf16", action="store_true", default=True,
-                        help="Use bfloat16")
-    parser.add_argument("--gradient_checkpointing", action="store_true", default=True,
-                        help="Use gradient checkpointing")
+    parser.add_argument("--no_bf16", action="store_false", dest="bf16", default=True,
+                        help="Disable bfloat16. Default: enabled")
+    parser.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing", default=True,
+                        help="Disable gradient checkpointing. Default: enabled")
 
     args = parser.parse_args()
 

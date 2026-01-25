@@ -22,6 +22,26 @@ BASE_MODELS = {
 FINETUNED_MODELS_DIR = "./outputs"
 
 
+def get_latest_checkpoint(model_dir: str) -> str:
+    """获取模型目录下最新的 checkpoint 子目录"""
+    checkpoints = []
+    for item in os.listdir(model_dir):
+        item_path = os.path.join(model_dir, item)
+        if os.path.isdir(item_path) and item.startswith("checkpoint-"):
+            try:
+                step = int(item.split("-")[1])
+                checkpoints.append((step, item_path))
+            except (ValueError, IndexError):
+                continue
+
+    if checkpoints:
+        # 返回步数最大的 checkpoint
+        checkpoints.sort(key=lambda x: x[0], reverse=True)
+        return checkpoints[0][1]
+
+    return model_dir
+
+
 def scan_finetuned_models() -> dict:
     """扫描 outputs 目录下的微调模型"""
     finetuned_models = {}
@@ -33,14 +53,21 @@ def scan_finetuned_models() -> dict:
         model_path = os.path.join(FINETUNED_MODELS_DIR, name)
         config_path = os.path.join(model_path, "finetune_config.json")
         adapter_config_path = os.path.join(model_path, "adapter_config.json")
+        grpo_config_path = os.path.join(model_path, "grpo_config.json")
 
-        # 检查是否有 LoRA 配置文件
+        # 检查是否有 LoRA/GRPO 配置文件
         if os.path.isdir(model_path) and (
-            os.path.exists(config_path) or os.path.exists(adapter_config_path)
+            os.path.exists(config_path) or os.path.exists(adapter_config_path) or os.path.exists(grpo_config_path)
         ):
-            # 使用 🔧 标识微调模型
-            display_name = f"🔧 {name} (LoRA)"
-            finetuned_models[display_name] = model_path
+            # 根据配置文件类型标识模型
+            if os.path.exists(grpo_config_path):
+                # GRPO 模型：查找最新的 checkpoint
+                actual_path = get_latest_checkpoint(model_path)
+                display_name = f"🔧 {name} (GRPO)"
+                finetuned_models[display_name] = actual_path
+            else:
+                display_name = f"🔧 {name} (LoRA)"
+                finetuned_models[display_name] = model_path
 
     return finetuned_models
 
@@ -102,6 +129,16 @@ def get_base_model_path(finetuned_path: str) -> str:
         except (json.JSONDecodeError, KeyError):
             pass
 
+    # 尝试从 grpo_config.json 读取
+    grpo_config_path = os.path.join(finetuned_path, "grpo_config.json")
+    if os.path.exists(grpo_config_path):
+        try:
+            with open(grpo_config_path) as f:
+                config = json.load(f)
+                return config.get("model_path", "./model_cache/Qwen/Qwen3-VL-2B-Instruct")
+        except (json.JSONDecodeError, KeyError):
+            pass
+
     return "./model_cache/Qwen/Qwen3-VL-2B-Instruct"
 
 
@@ -144,6 +181,15 @@ def load_model(model_choice: str) -> str:
         _processor = None
         torch.cuda.empty_cache()
 
+    # Check flash attention availability
+    try:
+        import flash_attn
+        attn_impl = "flash_attention_2"
+        print("Using Flash Attention 2")
+    except ImportError:
+        attn_impl = "sdpa"
+        print("Flash Attention not available, using SDPA")
+
     try:
         if is_finetuned_model(model_choice):
             # 加载微调模型
@@ -160,6 +206,7 @@ def load_model(model_choice: str) -> str:
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
                 trust_remote_code=True,
+                attn_implementation=attn_impl,
             )
 
             # 加载 LoRA 权重并合并
@@ -185,6 +232,7 @@ def load_model(model_choice: str) -> str:
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
                 trust_remote_code=True,
+                attn_implementation=attn_impl,
             )
 
             _current_model_name = model_choice
@@ -528,4 +576,4 @@ with gr.Blocks(title="交通设备异常检测", theme=gr.themes.Soft()) as demo
 
 if __name__ == "__main__":
     print("启动交通设备异常检测系统...")
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(server_name="0.0.0.0", server_port=17860)

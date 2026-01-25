@@ -28,7 +28,7 @@ OUTPUT_DIR="outputs/qwen3vl_lora"
 LORA_ALPHA=16
 LORA_DROPOUT=0.1
 MAX_LENGTH=2048
-USE_4BIT=true
+DISABLE_4BIT=false                # 设为 true 关闭 4bit (默认开启)
 SAVE_STEPS=500
 
 #==========================================
@@ -71,8 +71,8 @@ CMD="python scripts/training/finetune_qwen_vl.py \
     --max_length $MAX_LENGTH \
     --save_steps $SAVE_STEPS"
 
-if [ "$USE_4BIT" = "true" ]; then
-    CMD="$CMD --use_4bit"
+if [ "$DISABLE_4BIT" = "true" ]; then
+    CMD="$CMD --no_4bit"
 fi
 
 echo ""

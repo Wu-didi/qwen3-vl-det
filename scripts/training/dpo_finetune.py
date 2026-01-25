@@ -77,6 +77,7 @@ class DPOConfig:
 
     # Data
     train_data: str = "data/dpo_data/train.json"
+    val_data: str = ""  # 验证集路径（可选）
     max_length: int = 2048
     max_image_size: int = 512
 
@@ -93,6 +94,7 @@ class DPOConfig:
     weight_decay: float = 0.01
     logging_steps: int = 10
     save_steps: int = 500
+    eval_steps: int = 500  # 每多少步验证一次
     max_grad_norm: float = 1.0
 
     # Other
@@ -175,6 +177,7 @@ class DPOTrainer:
         )
 
         self.global_step = 0
+        self.best_val_accuracy = 0.0  # 记录最佳验证准确率
 
     def compute_log_probs(
         self,
@@ -210,8 +213,9 @@ class DPOTrainer:
             text=[text],
             images=[image],
             return_tensors="pt",
-            padding=True,
-            truncation=False,
+            padding=False,  # Single sample, no padding needed
+            truncation=True,  # Enable truncation to prevent OOM
+            max_length=self.config.max_length,  # Use configured max_length
         ).to(model.device)
 
         # Forward pass
@@ -293,7 +297,87 @@ class DPOTrainer:
             "accuracy": accuracy.item(),
         }
 
-    def train(self, dataset: DPODataset):
+    @torch.no_grad()
+    def evaluate(self, val_dataset: DPODataset, num_samples: int = None) -> Dict[str, float]:
+        """在验证集上评估模型
+
+        Args:
+            val_dataset: 验证数据集
+            num_samples: 评估的样本数量（None 表示全部）
+
+        Returns:
+            验证指标字典
+        """
+        logger.info("Running validation...")
+        self.model.eval()
+
+        # 限制验证样本数量以节省时间
+        if num_samples is None:
+            num_samples = len(val_dataset)
+        num_samples = min(num_samples, len(val_dataset))
+
+        val_stats = []
+
+        for i in tqdm(range(num_samples), desc="Validation"):
+            sample = val_dataset[i]
+            image = sample["image"]
+            prompt = sample["prompt"]
+            chosen = sample["chosen"]
+            rejected = sample["rejected"]
+
+            # 计算 chosen 和 rejected 的 log probs
+            policy_chosen_logps = self.compute_log_probs(
+                self.model, image, prompt, chosen
+            )
+            policy_rejected_logps = self.compute_log_probs(
+                self.model, image, prompt, rejected
+            )
+
+            # 计算 reference model 的 log probs
+            ref_chosen_logps = self.compute_log_probs(
+                self.ref_model, image, prompt, chosen
+            )
+            ref_rejected_logps = self.compute_log_probs(
+                self.ref_model, image, prompt, rejected
+            )
+
+            # 计算 DPO 损失
+            loss = self.dpo_loss(
+                policy_chosen_logps,
+                policy_rejected_logps,
+                ref_chosen_logps,
+                ref_rejected_logps,
+            )
+
+            # 计算统计信息
+            chosen_reward = self.config.beta * (policy_chosen_logps - ref_chosen_logps)
+            rejected_reward = self.config.beta * (policy_rejected_logps - ref_rejected_logps)
+            reward_margin = chosen_reward - rejected_reward
+            accuracy = (reward_margin > 0).float()
+
+            val_stats.append({
+                "loss": loss.item(),
+                "accuracy": accuracy.item(),
+                "reward_margin": reward_margin.item(),
+            })
+
+        # 计算平均指标
+        avg_stats = {
+            "val_loss": sum(s["loss"] for s in val_stats) / len(val_stats),
+            "val_accuracy": sum(s["accuracy"] for s in val_stats) / len(val_stats),
+            "val_reward_margin": sum(s["reward_margin"] for s in val_stats) / len(val_stats),
+        }
+
+        logger.info(
+            f"Validation results: loss={avg_stats['val_loss']:.4f}, "
+            f"accuracy={avg_stats['val_accuracy']:.2f}, "
+            f"reward_margin={avg_stats['val_reward_margin']:.4f}"
+        )
+
+        self.model.train()
+        return avg_stats
+
+    def train(self, dataset: DPODataset, val_dataset: DPODataset = None):
         """训练循环"""
         logger.info("Starting DPO training...")
 
@@ -362,6 +446,16 @@ class DPOTrainer:
                         logger.info(
                             f"Step {self.global_step}: loss={avg_loss:.4f}, accuracy={avg_acc:.2f}"
                         )
+
+                    # ✅ 新增：验证逻辑
+                    if val_dataset and self.config.eval_steps > 0 and self.global_step % self.config.eval_steps == 0:
+                        val_stats = self.evaluate(val_dataset, num_samples=50)  # 验证 50 个样本
+
+                        # 保存最佳模型
+                        if val_stats["val_accuracy"] > self.best_val_accuracy:
+                            self.best_val_accuracy = val_stats["val_accuracy"]
+                            logger.info(f"New best validation accuracy: {self.best_val_accuracy:.2f}")
+                            self.save_checkpoint("best")
 
                     if self.global_step % self.config.save_steps == 0:
                         self.save_checkpoint(f"checkpoint-{self.global_step}")
@@ -477,8 +571,10 @@ def main():
 
     # Model arguments
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-VL-2B-Instruct")
-    parser.add_argument("--use_4bit", action="store_true")
-    parser.add_argument("--use_8bit", action="store_true")
+    parser.add_argument("--no_4bit", action="store_false", dest="use_4bit", default=True,
+                        help="Disable 4-bit quantization (QLoRA). Default: enabled")
+    parser.add_argument("--use_8bit", action="store_true", default=False,
+                        help="Use 8-bit quantization")
 
     # LoRA arguments
     parser.add_argument("--lora_r", type=int, default=64)
@@ -487,6 +583,8 @@ def main():
 
     # Data arguments
     parser.add_argument("--train_data", type=str, required=True)
+    parser.add_argument("--val_data", type=str, default="",
+                        help="Path to validation data (optional)")
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--max_image_size", type=int, default=512)
 
@@ -502,10 +600,13 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--eval_steps", type=int, default=500,
+                        help="Evaluate every N steps (0 to disable)")
 
     # Other
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--bf16", action="store_true", default=True)
+    parser.add_argument("--no_bf16", action="store_false", dest="bf16", default=True,
+                        help="Disable bfloat16. Default: enabled")
 
     args = parser.parse_args()
 
@@ -517,6 +618,7 @@ def main():
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         train_data=args.train_data,
+        val_data=args.val_data,
         max_length=args.max_length,
         max_image_size=args.max_image_size,
         beta=args.beta,
@@ -527,6 +629,7 @@ def main():
         learning_rate=args.learning_rate,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        eval_steps=args.eval_steps,
         seed=args.seed,
         bf16=args.bf16,
     )
@@ -546,6 +649,19 @@ def main():
         config.max_image_size
     )
 
+    # 加载验证集（如果提供）
+    val_dataset = None
+    if config.val_data and os.path.exists(config.val_data):
+        logger.info(f"Loading validation data from {config.val_data}")
+        val_dataset = DPODataset(
+            config.val_data,
+            processor,
+            config.max_length,
+            config.max_image_size
+        )
+    else:
+        logger.info("No validation data provided, skipping validation")
+
     # 创建训练器
     trainer = DPOTrainer(
         model=model,
@@ -555,7 +671,7 @@ def main():
     )
 
     # 开始训练
-    trainer.train(dataset)
+    trainer.train(dataset, val_dataset=val_dataset)
 
 
 if __name__ == "__main__":

@@ -73,7 +73,7 @@ DEVICE=cuda
 TORCH_DTYPE=bfloat16
 CONFIDENCE_THRESHOLD=0.5
 ```
-
+export CUDA_VISIBLE_DEVICES=7
 ### 4. 启动服务
 
 **REST API 服务**

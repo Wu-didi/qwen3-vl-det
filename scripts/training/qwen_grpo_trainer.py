@@ -52,13 +52,15 @@ class QwenVLGRPOTrainer(GRPOTrainer):
         # Get stored images
         images = getattr(self, '_current_images', None)
 
-        # Build processor kwargs - don't truncate for multimodal inputs
+        # Build processor kwargs with proper truncation
         processor_kwargs = {
             "text": prompts,
             "return_tensors": "pt",
-            "padding": True,
+            "padding": True,  # Need padding for batched generation
             "padding_side": "left",
             "add_special_tokens": False,
+            "max_length": self.args.max_prompt_length,
+            "truncation": True,  # Enable truncation to prevent OOM
         }
 
         # Add images if available
@@ -185,8 +187,10 @@ class QwenVLGRPOTrainer(GRPOTrainer):
         if images is not None:
             processor_kwargs = dict(
                 text=prompts,
-                padding=True,
+                padding=True,  # Need padding for batched forward pass
                 return_tensors="pt",
+                max_length=self.args.max_prompt_length,
+                truncation=True,  # Enable truncation to prevent OOM
             )
             processor_kwargs["images"] = images
 

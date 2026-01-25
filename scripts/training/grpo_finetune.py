@@ -81,6 +81,7 @@ class GRPOConfig:
 
     # Data
     train_data: str = "data/qwen_data/train.json"
+    val_data: str = ""  # 验证集路径（可选）
     max_length: int = 2048
     max_new_tokens: int = 512  # 检测 JSON 输出通常不需要太长
     max_image_size: int = 512  # 图片最大边长
@@ -101,6 +102,7 @@ class GRPOConfig:
     weight_decay: float = 0.01
     logging_steps: int = 10
     save_steps: int = 200
+    eval_steps: int = 200  # 每多少步验证一次
     max_grad_norm: float = 1.0
 
     # Reward weights
@@ -284,7 +286,9 @@ class RewardCalculator:
 
                 # 平均 IoU 作为 bbox 奖励
                 avg_iou = sum(ious) / len(ious) if ious else 0.0
-                rewards["bbox"] = avg_iou * 2 - 1  # 映射到 [-1, 1]
+                # ✅ 修复: 使用更温和的映射，避免过度惩罚低 IoU
+                # 使用平方根映射: IoU=0.25 时 reward=0, IoU=1.0 时 reward=1
+                rewards["bbox"] = (avg_iou ** 0.5) * 2 - 1  # 映射到 [-1, 1]
 
                 # 类别匹配率作为 category 奖励
                 cat_match_rate = sum(category_matches) / len(category_matches) if category_matches else 0.0
@@ -340,21 +344,70 @@ class GRPODataset(Dataset):
             if self.max_image_size and max(image.size) > self.max_image_size:
                 ratio = self.max_image_size / max(image.size)
                 new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
-                image = image.resize(new_size, Image.LANCZOS)
+                # Handle Pillow version compatibility
+                try:
+                    resample = Image.Resampling.LANCZOS  # Pillow 10+
+                except AttributeError:
+                    resample = Image.LANCZOS  # Pillow 9-
+                image = image.resize(new_size, resample)
         except Exception as e:
             logger.warning(f"Failed to load image {image_path}: {e}")
             image = Image.new("RGB", (224, 224), color="white")
 
-        # Extract messages
-        user_msg = conversations[0]["value"]
-        assistant_msg = conversations[1]["value"]
+        # ✅ 修复：使用 from 字段，支持多轮对话
+        # 提取所有消息，按 from 字段映射角色
+        user_messages = []
+        assistant_messages = []
+
+        for conv in conversations:
+            role = conv.get("from", "user")
+            # 标准化角色名称
+            if role in ["human", "user"]:
+                role = "user"
+            elif role in ["gpt", "assistant"]:
+                role = "assistant"
+
+            text = conv.get("value", "").replace("<image>\n", "").replace("<image>", "")
+
+            if role == "user":
+                user_messages.append(text)
+            elif role == "assistant":
+                assistant_messages.append(text)
+
+        # 对于 GRPO，我们需要：
+        # - prompt: 最后一条 user 消息（或拼接所有 user 消息）
+        # - reference_response: 最后一条 assistant 消息
+        if not user_messages or not assistant_messages:
+            logger.warning(
+                f"Sample {idx}: missing user or assistant messages in conversations. "
+                f"Found {len(user_messages)} user messages and {len(assistant_messages)} assistant messages. "
+                f"Attempting fallback by assuming first message is user and second is assistant."
+            )
+            # 回退：假设前两条消息分别是 user 和 assistant（不依赖 from 字段）
+            if len(conversations) >= 2:
+                user_msg = conversations[0].get("value", "").replace("<image>\n", "").replace("<image>", "")
+                assistant_msg = conversations[1].get("value", "")
+            else:
+                logger.error(f"Sample {idx}: insufficient conversations, skipping")
+                # 返回空数据，让 DataLoader 跳过
+                return {
+                    "image": Image.new("RGB", (224, 224)),
+                    "prompt": "",
+                    "ground_truth": {"has_anomaly": False, "detections": [], "summary": ""},
+                    "reference_response": "",
+                }
+        else:
+            # 使用最后一条 user 消息作为 prompt（对于单轮检测任务）
+            # 如果需要多轮上下文，可以改为拼接所有消息
+            user_msg = user_messages[-1]
+            assistant_msg = assistant_messages[-1]
 
         # 解析 ground truth
         ground_truth = self._parse_ground_truth(assistant_msg)
 
         return {
             "image": image,
-            "prompt": user_msg.replace("<image>\n", "").replace("<image>", ""),
+            "prompt": user_msg,  # 已经在上面处理过 <image> 占位符了
             "ground_truth": ground_truth,
             "reference_response": assistant_msg,
         }
@@ -456,6 +509,7 @@ class GRPOTrainer:
         logger.info(f"Warmup scheduler: {warmup_steps} steps (ratio={config.warmup_ratio})")
 
         self.global_step = 0
+        self.best_val_reward = float('-inf')  # 记录最佳验证 reward
 
     @torch.no_grad()
     def generate_responses(
@@ -489,6 +543,9 @@ class GRPOTrainer:
             text=[text],
             images=[image],
             return_tensors="pt",
+            padding=False,  # Single sample, no padding needed
+            truncation=True,  # Enable truncation to prevent OOM
+            max_length=self.config.max_length,  # Use configured max_length
         ).to(self.model.device)
 
         # 批量生成所有响应 (更高效)
@@ -548,8 +605,12 @@ class GRPOTrainer:
         except Exception:
             pass
 
-        # 回退策略
-        return int(len(input_ids_list) * 0.5)
+        # ✅ 修复: 更保守的回退策略，使用 70% 位置更可能在 assistant 部分
+        logger.warning(
+            f"Cannot find assistant start position reliably, using 70% fallback. "
+            f"This may cause training issues. Consider checking tokenizer configuration."
+        )
+        return int(len(input_ids_list) * 0.7)
 
     def compute_log_probs(
         self,
@@ -585,8 +646,9 @@ class GRPOTrainer:
             text=[text],
             images=[image],
             return_tensors="pt",
-            padding=True,
-            truncation=False,
+            padding=False,  # Single sample, no padding needed
+            truncation=True,  # Enable truncation to prevent OOM
+            max_length=self.config.max_length,  # Use configured max_length
         ).to(model.device)
 
         # ✅ 关键修复1: 创建 labels 并 mask prompt 部分
@@ -730,7 +792,69 @@ class GRPOTrainer:
             "mean_kl": sum(kl_divs) / len(kl_divs),
         }
 
-    def train(self, dataset: GRPODataset):
+    @torch.no_grad()
+    def evaluate(self, val_dataset: GRPODataset, num_samples: int = None) -> Dict[str, float]:
+        """在验证集上评估模型
+
+        Args:
+            val_dataset: 验证数据集
+            num_samples: 评估的样本数量（None 表示全部）
+
+        Returns:
+            验证指标字典
+        """
+        logger.info("Running validation...")
+        self.model.eval()
+
+        # 限制验证样本数量以节省时间
+        if num_samples is None:
+            num_samples = len(val_dataset)
+        num_samples = min(num_samples, len(val_dataset))
+
+        val_stats = []
+
+        for i in tqdm(range(num_samples), desc="Validation"):
+            sample = val_dataset[i]
+            image = sample["image"]
+            prompt = sample["prompt"]
+            ground_truth = sample["ground_truth"]
+
+            # 生成单个响应（验证时不需要多个）
+            responses = self.generate_responses(image, prompt, num_generations=1)
+            response = responses[0]
+
+            # 计算奖励
+            reward, breakdown = self.reward_calculator.compute_reward(
+                response, ground_truth
+            )
+
+            val_stats.append({
+                "reward": reward,
+                "format": breakdown["format"],
+                "bbox": breakdown["bbox"],
+                "category": breakdown["category"],
+                "completeness": breakdown["completeness"],
+            })
+
+        # 计算平均指标
+        avg_stats = {
+            "val_reward": sum(s["reward"] for s in val_stats) / len(val_stats),
+            "val_format": sum(s["format"] for s in val_stats) / len(val_stats),
+            "val_bbox": sum(s["bbox"] for s in val_stats) / len(val_stats),
+            "val_category": sum(s["category"] for s in val_stats) / len(val_stats),
+            "val_completeness": sum(s["completeness"] for s in val_stats) / len(val_stats),
+        }
+
+        logger.info(
+            f"Validation results: reward={avg_stats['val_reward']:.4f}, "
+            f"format={avg_stats['val_format']:.4f}, bbox={avg_stats['val_bbox']:.4f}, "
+            f"category={avg_stats['val_category']:.4f}"
+        )
+
+        self.model.train()
+        return avg_stats
+
+    def train(self, dataset: GRPODataset, val_dataset: GRPODataset = None):
         """训练循环（修复版：正确的梯度累积顺序）"""
         logger.info("Starting GRPO training...")
 
@@ -829,6 +953,16 @@ class GRPOTrainer:
                                 f"loss={avg_loss:.4f}, reward={avg_reward:.4f}, kl={avg_kl:.4f}, lr={current_lr:.2e}"
                             )
 
+                    # ✅ 新增：验证逻辑
+                    if val_dataset and self.config.eval_steps > 0 and self.global_step % self.config.eval_steps == 0:
+                        val_stats = self.evaluate(val_dataset, num_samples=50)  # 验证 50 个样本
+
+                        # 保存最佳模型
+                        if val_stats["val_reward"] > self.best_val_reward:
+                            self.best_val_reward = val_stats["val_reward"]
+                            logger.info(f"New best validation reward: {self.best_val_reward:.4f}")
+                            self.save_checkpoint("best")
+
                     # 清理显存
                     if self.global_step % 5 == 0:
                         torch.cuda.empty_cache()
@@ -840,6 +974,23 @@ class GRPOTrainer:
                     "kl": f"{avg_stats['mean_kl']:.4f}",
                     "samples": total_samples,
                 })
+
+            # ✅ 修复: 处理 epoch 结束时剩余的梯度
+            if accumulated_steps % self.config.gradient_accumulation_steps != 0:
+                logger.info(f"Applying remaining gradients at end of epoch {epoch + 1}")
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.max_grad_norm
+                )
+                # 执行优化步骤
+                self.optimizer.step()
+                # 更新学习率
+                self.scheduler.step()
+                # 清空梯度
+                self.optimizer.zero_grad()
+                self.global_step += 1
+                logger.info(f"Final gradient step for epoch {epoch + 1}, global_step={self.global_step}")
 
         # 保存最终模型
         self.save_checkpoint("final")
@@ -958,8 +1109,10 @@ def create_reference_model(config: GRPOConfig):
         from peft import PeftModel
         logger.info(f"Loading SFT LoRA weights for reference model from {config.sft_model_path}")
         ref_model = PeftModel.from_pretrained(ref_model, config.sft_model_path)
-        ref_model = ref_model.merge_and_unload()  # 合并权重以提高推理速度
-        logger.info("Reference model: SFT weights merged")
+        # ✅ 修复: 不要 merge，避免 4-bit 模型的内存问题
+        # merge_and_unload() 在量化模型上可能导致 OOM 或精度损失
+        # 保持 PEFT 格式，速度稍慢但更安全
+        logger.info("Reference model: Using PEFT adapter (not merged for safety)")
 
     # 冻结参考模型
     ref_model.eval()
@@ -976,8 +1129,10 @@ def main():
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-VL-2B-Instruct")
     parser.add_argument("--sft_model_path", type=str, default="",
                         help="Path to SFT fine-tuned LoRA model (optional, for continuing from SFT)")
-    parser.add_argument("--use_4bit", action="store_true", default=True)
-    parser.add_argument("--use_8bit", action="store_true")
+    parser.add_argument("--no_4bit", action="store_false", dest="use_4bit", default=True,
+                        help="Disable 4-bit quantization (QLoRA). Default: enabled")
+    parser.add_argument("--use_8bit", action="store_true", default=False,
+                        help="Use 8-bit quantization")
 
     # LoRA arguments
     parser.add_argument("--lora_r", type=int, default=64)
@@ -986,6 +1141,8 @@ def main():
 
     # Data arguments
     parser.add_argument("--train_data", type=str, required=True)
+    parser.add_argument("--val_data", type=str, default="",
+                        help="Path to validation data (optional)")
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--max_image_size", type=int, default=512,
                         help="Maximum image size (longest edge)")
@@ -1004,10 +1161,13 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=200)
+    parser.add_argument("--eval_steps", type=int, default=200,
+                        help="Evaluate every N steps (0 to disable)")
 
     # Other
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--bf16", action="store_true", default=True)
+    parser.add_argument("--no_bf16", action="store_false", dest="bf16", default=True,
+                        help="Disable bfloat16. Default: enabled")
 
     args = parser.parse_args()
 
@@ -1021,6 +1181,7 @@ def main():
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         train_data=args.train_data,
+        val_data=args.val_data,
         max_length=args.max_length,
         max_image_size=args.max_image_size,
         num_generations=args.num_generations,
@@ -1033,6 +1194,7 @@ def main():
         learning_rate=args.learning_rate,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        eval_steps=args.eval_steps,
         seed=args.seed,
         bf16=args.bf16,
     )
@@ -1054,6 +1216,14 @@ def main():
     # 创建数据集
     dataset = GRPODataset(config.train_data, processor, config.max_length, config.max_image_size)
 
+    # 加载验证集（如果提供）
+    val_dataset = None
+    if config.val_data and os.path.exists(config.val_data):
+        logger.info(f"Loading validation data from {config.val_data}")
+        val_dataset = GRPODataset(config.val_data, processor, config.max_length, config.max_image_size)
+    else:
+        logger.info("No validation data provided, skipping validation")
+
     # ✅ 计算总步数（用于 warmup scheduler）
     total_samples = len(dataset) * config.num_epochs
     total_steps = total_samples // config.gradient_accumulation_steps
@@ -1073,7 +1243,7 @@ def main():
     )
 
     # 开始训练
-    trainer.train(dataset)
+    trainer.train(dataset, val_dataset=val_dataset)
 
 
 if __name__ == "__main__":

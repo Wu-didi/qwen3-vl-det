@@ -31,6 +31,7 @@ BETA=0.5                          # KL 惩罚系数 (防止模型偏离太远)
 MODEL_PATH="./model_cache/Qwen/Qwen3-VL-2B-Instruct"
 SFT_MODEL_PATH="./outputs/qwen3vl_lora"   # SFT 模型路径 (留空从基础模型开始)
 TRAIN_DATA="data/hefei_last_dataset/qwen_data/train.json"
+VAL_DATA="data/hefei_last_dataset/qwen_data/val.json"  # 验证集路径 (留空则不验证)
 OUTPUT_DIR="outputs/qwen3vl_grpo_trl"
 
 #==========================================
@@ -41,7 +42,12 @@ LORA_DROPOUT=0.1
 MAX_COMPLETION_LENGTH=512
 MAX_PROMPT_LENGTH=1024
 SAVE_STEPS=200
+EVAL_STEPS=200                    # 每多少步验证一次 (0 表示不验证)
 LOGGING_STEPS=10
+
+# 量化和精度选项
+DISABLE_4BIT=false                # 设为 true 关闭 4bit (默认开启)
+DISABLE_BF16=false                # 设为 true 关闭 bf16 (默认开启)
 
 # 日志选项
 USE_WANDB=false                   # 是否使用 wandb (需要 pip install wandb)
@@ -96,12 +102,24 @@ CMD="python scripts/training/grpo_finetune_trl.py \
     --max_completion_length $MAX_COMPLETION_LENGTH \
     --max_prompt_length $MAX_PROMPT_LENGTH \
     --save_steps $SAVE_STEPS \
-    --logging_steps $LOGGING_STEPS \
-    --use_4bit \
-    --bf16"
+    --eval_steps $EVAL_STEPS \
+    --logging_steps $LOGGING_STEPS"
+
+# 量化和精度选项 (默认都开启)
+if [ "$DISABLE_4BIT" = "true" ]; then
+    CMD="$CMD --no_4bit"
+fi
+
+if [ "$DISABLE_BF16" = "true" ]; then
+    CMD="$CMD --no_bf16"
+fi
 
 if [ -n "$SFT_MODEL_PATH" ]; then
     CMD="$CMD --sft_model_path $SFT_MODEL_PATH"
+fi
+
+if [ -n "$VAL_DATA" ] && [ -f "$VAL_DATA" ]; then
+    CMD="$CMD --val_data $VAL_DATA"
 fi
 
 if [ "$USE_WANDB" = "true" ]; then

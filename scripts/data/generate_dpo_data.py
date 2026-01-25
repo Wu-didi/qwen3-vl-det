@@ -224,6 +224,8 @@ def generate_rejected_by_model(
     inputs = processor(
         text=[text],
         images=[image],
+        truncation=True,  # Enable truncation for safety
+        max_length=2048,  # Reasonable default for data generation
         return_tensors="pt",
     ).to(model.device)
 
@@ -300,8 +302,32 @@ def convert_sft_to_dpo(
         image_path = item["image"]
         conversations = item["conversations"]
 
-        user_msg = conversations[0]["value"]
-        assistant_msg = conversations[1]["value"]
+        # ✅ 修复：使用 from 字段，支持多轮对话
+        user_messages = []
+        assistant_messages = []
+
+        for conv in conversations:
+            role = conv.get("from", "user")
+            # 标准化角色名称
+            if role in ["human", "user"]:
+                role = "user"
+            elif role in ["gpt", "assistant"]:
+                role = "assistant"
+
+            text = conv.get("value", "")
+
+            if role == "user":
+                user_messages.append(text)
+            elif role == "assistant":
+                assistant_messages.append(text)
+
+        # 使用最后一条消息
+        if not user_messages or not assistant_messages:
+            logger.warning(f"Skipping sample: missing user or assistant messages")
+            continue
+
+        user_msg = user_messages[-1]
+        assistant_msg = assistant_messages[-1]
 
         # chosen = 原始标注
         chosen = assistant_msg

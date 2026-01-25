@@ -301,12 +301,33 @@ def load_and_prepare_dataset(
             skipped += 1
             continue
 
-        # Extract user prompt and assistant response
-        user_msg = conversations[0]["value"]
-        assistant_msg = conversations[1]["value"]
+        # ✅ 修复：使用 from 字段，支持多轮对话
+        user_messages = []
+        assistant_messages = []
 
-        # Remove <image> placeholder from user message (will be added by processor)
-        user_msg = user_msg.replace("<image>\n", "").replace("<image>", "").strip()
+        for conv in conversations:
+            role = conv.get("from", "user")
+            # 标准化角色名称
+            if role in ["human", "user"]:
+                role = "user"
+            elif role in ["gpt", "assistant"]:
+                role = "assistant"
+
+            text = conv.get("value", "").replace("<image>\n", "").replace("<image>", "").strip()
+
+            if role == "user":
+                user_messages.append(text)
+            elif role == "assistant":
+                assistant_messages.append(text)
+
+        # 使用最后一条消息（对于单轮检测任务）
+        if not user_messages or not assistant_messages:
+            logger.warning(f"Sample {idx}: missing user or assistant messages, skipping")
+            skipped += 1
+            continue
+
+        user_msg = user_messages[-1]
+        assistant_msg = assistant_messages[-1]
 
         # Build chat messages for prompt
         messages = [
@@ -351,7 +372,12 @@ def load_image_lazy(image_path: str, max_image_size: int = 512) -> Image.Image:
         if max_image_size and max(image.size) > max_image_size:
             ratio = max_image_size / max(image.size)
             new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
-            image = image.resize(new_size, Image.LANCZOS)
+            # Handle Pillow version compatibility
+            try:
+                resample = Image.Resampling.LANCZOS  # Pillow 10+
+            except AttributeError:
+                resample = Image.LANCZOS  # Pillow 9-
+            image = image.resize(new_size, resample)
         return image
     except Exception as e:
         logger.warning(f"Failed to load image {image_path}: {e}")
@@ -457,8 +483,9 @@ def create_model_and_processor(
         from peft import PeftModel
         logger.info(f"Loading SFT LoRA weights from {sft_model_path}")
         model = PeftModel.from_pretrained(model, sft_model_path, is_trainable=True)
-        logger.info("SFT LoRA weights loaded")
-        peft_config = None  # Don't apply new LoRA, use loaded one
+        logger.info("SFT LoRA weights loaded, model is already a PEFT model")
+        # Keep peft_config for trainer to recognize this is a PEFT model
+        # The trainer will detect the existing adapter and not apply a new one
 
     return model, processor, peft_config
 
@@ -474,8 +501,16 @@ def main():
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-VL-2B-Instruct")
     parser.add_argument("--sft_model_path", type=str, default="",
                         help="Path to SFT LoRA model to continue from")
-    parser.add_argument("--use_4bit", action="store_true", default=True)
-    parser.add_argument("--bf16", action="store_true", default=True)
+    parser.add_argument("--use_4bit", action="store_true",
+                        help="Use 4-bit quantization (default: enabled, use --no_4bit to disable)")
+    parser.add_argument("--no_4bit", dest="use_4bit", action="store_false",
+                        help="Disable 4-bit quantization")
+    parser.set_defaults(use_4bit=True)
+    parser.add_argument("--bf16", action="store_true",
+                        help="Use bfloat16 precision (default: enabled, use --no_bf16 to disable)")
+    parser.add_argument("--no_bf16", dest="bf16", action="store_false",
+                        help="Disable bfloat16 precision")
+    parser.set_defaults(bf16=True)
 
     # LoRA arguments
     parser.add_argument("--lora_r", type=int, default=64)
@@ -484,6 +519,8 @@ def main():
 
     # Data arguments
     parser.add_argument("--train_data", type=str, required=True)
+    parser.add_argument("--val_data", type=str, default="",
+                        help="Path to validation data (optional)")
     parser.add_argument("--max_image_size", type=int, default=512)
 
     # GRPO arguments
@@ -502,6 +539,8 @@ def main():
     parser.add_argument("--max_prompt_length", type=int, default=1024)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=200)
+    parser.add_argument("--eval_steps", type=int, default=200,
+                        help="Evaluate every N steps (0 to disable)")
 
     # Logging
     parser.add_argument("--use_wandb", action="store_true",
@@ -549,6 +588,18 @@ def main():
         max_image_size=args.max_image_size,
     )
 
+    # Load validation dataset (if provided)
+    eval_dataset = None
+    if args.val_data and os.path.exists(args.val_data):
+        logger.info(f"Loading validation data from {args.val_data}")
+        eval_dataset = load_and_prepare_dataset(
+            data_path=args.val_data,
+            processor=processor,
+            max_image_size=args.max_image_size,
+        )
+    else:
+        logger.info("No validation data provided, skipping validation")
+
     # Define reward functions
     reward_funcs = [
         format_reward,
@@ -588,6 +639,8 @@ def main():
         learning_rate=args.learning_rate,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        eval_steps=args.eval_steps if eval_dataset else None,
+        eval_strategy="steps" if eval_dataset and args.eval_steps > 0 else "no",
         save_total_limit=3,
         bf16=args.bf16,
         remove_unused_columns=False,
@@ -613,6 +666,7 @@ def main():
         reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         processing_class=processor,
         peft_config=peft_config,
     )

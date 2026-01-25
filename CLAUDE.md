@@ -82,9 +82,20 @@ python scripts/training/finetune_qwen_vl.py \
 python scripts/training/grpo_finetune.py \
     --model_path Qwen/Qwen3-VL-2B-Instruct \
     --train_data data/qwen_data/train.json \
+    --val_data data/qwen_data/val.json \
     --output_dir outputs/qwen3vl_grpo \
     --num_generations 4 \
-    --kl_coef 0.1
+    --kl_coef 0.1 \
+    --eval_steps 200
+
+# Run DPO (direct preference optimization) fine-tuning
+python scripts/training/dpo_finetune.py \
+    --model_path Qwen/Qwen3-VL-2B-Instruct \
+    --train_data data/dpo_data/train.json \
+    --val_data data/dpo_data/val.json \
+    --output_dir outputs/qwen3vl_dpo \
+    --beta 0.1 \
+    --eval_steps 500
 
 # Inference with fine-tuned model
 python scripts/inference/inference_finetuned.py \
@@ -164,6 +175,53 @@ gradio_app.py                # Gradio Web UI
 4. **Response Parsing**: `detector._extract_json()` handles JSON in markdown code blocks or raw format
 5. **Fine-tuning**: QLoRA (4-bit) by default for memory efficiency; targets q/k/v/o/gate/up/down projections
 6. **GRPO Training**: Reward based on format correctness, bbox IoU, category accuracy; uses KL divergence penalty
+7. **Validation**: All training scripts support validation on held-out data; best models saved based on validation metrics
+
+## Training & Validation
+
+### Validation Support
+
+All training scripts now support validation during training:
+
+- **LoRA/QLoRA** (`finetune_qwen_vl.py`): Validates every 500 steps, tracks validation loss
+- **GRPO** (`grpo_finetune.py`): Validates every 200 steps, tracks reward/format/bbox/category metrics
+- **DPO** (`dpo_finetune.py`): Validates every 500 steps, tracks loss/accuracy/reward_margin
+
+### Best Model Selection
+
+- **LoRA**: Uses Hugging Face Trainer's built-in checkpointing (saves last 3 checkpoints)
+- **GRPO**: Saves best model based on `val_reward` to `{output_dir}/best/`
+- **DPO**: Saves best model based on `val_accuracy` to `{output_dir}/best/`
+
+### Disabling Validation
+
+```bash
+# Method 1: Don't provide --val_data
+python scripts/training/grpo_finetune.py --train_data data.json --output_dir outputs/
+
+# Method 2: Set --eval_steps 0
+python scripts/training/grpo_finetune.py --train_data data.json --val_data val.json --eval_steps 0
+
+# Method 3: In shell scripts, set VAL_DATA="" or EVAL_STEPS=0
+```
+
+### Quantization Control
+
+All training scripts now use `--no_*` flags to disable default-enabled features:
+
+```bash
+# Disable 4-bit quantization (use full precision LoRA)
+python scripts/training/finetune_qwen_vl.py --train_data data.json --no_4bit
+
+# Disable bfloat16 (use float16 instead)
+python scripts/training/finetune_qwen_vl.py --train_data data.json --no_bf16
+
+# Disable gradient checkpointing (faster but more VRAM)
+python scripts/training/finetune_qwen_vl.py --train_data data.json --no_gradient_checkpointing
+
+# In shell scripts
+DISABLE_4BIT=true ./scripts/run/train_lora.sh
+```
 
 ## Detection Categories
 
