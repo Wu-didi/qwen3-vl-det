@@ -107,6 +107,11 @@ python scripts/inference/infer.py \
     --model ./model_cache/Qwen/Qwen3-VL-2B-Instruct \
     --image test.jpg \
     --output result.jpg
+
+# Visualize training logs
+python scripts/visualize_training_log.py \
+    --log outputs/qwen3vl_grpo/training_log.json \
+    --output plots/
 ```
 
 ### Docker
@@ -176,6 +181,7 @@ gradio_app.py                # Gradio Web UI
 5. **Fine-tuning**: QLoRA (4-bit) by default for memory efficiency; targets q/k/v/o/gate/up/down projections
 6. **GRPO Training**: Reward based on format correctness, bbox IoU, category accuracy; uses KL divergence penalty
 7. **Validation**: All training scripts support validation on held-out data; best models saved based on validation metrics
+8. **Training Logs**: All training scripts automatically save detailed logs to `training_log.json` for analysis and visualization
 
 ## Training & Validation
 
@@ -186,6 +192,34 @@ All training scripts now support validation during training:
 - **LoRA/QLoRA** (`finetune_qwen_vl.py`): Validates every 500 steps, tracks validation loss
 - **GRPO** (`grpo_finetune.py`): Validates every 200 steps, tracks reward/format/bbox/category metrics
 - **DPO** (`dpo_finetune.py`): Validates every 500 steps, tracks loss/accuracy/reward_margin
+
+### Training Logs
+
+All training scripts automatically save detailed logs to `training_log.json`:
+
+**Log Contents**:
+- Training configuration (hyperparameters, model path, etc.)
+- Training history (loss, reward, learning rate per step)
+- Validation history (validation metrics per eval step)
+- Best checkpoint information (step, metrics, path)
+
+**Visualization**:
+```bash
+# View training summary
+python scripts/visualize_training_log.py --log outputs/qwen3vl_grpo/training_log.json
+
+# Generate training curves
+python scripts/visualize_training_log.py \
+    --log outputs/qwen3vl_grpo/training_log.json \
+    --output plots/
+
+# Export to CSV
+python scripts/visualize_training_log.py \
+    --log outputs/qwen3vl_grpo/training_log.json \
+    --export-csv
+```
+
+See [TRAINING_LOGS.md](TRAINING_LOGS.md) for detailed documentation.
 
 ### Best Model Selection
 

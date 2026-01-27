@@ -179,6 +179,14 @@ class DPOTrainer:
         self.global_step = 0
         self.best_val_accuracy = 0.0  # 记录最佳验证准确率
 
+        # 训练日志
+        self.training_log = {
+            "config": vars(config),
+            "train_history": [],
+            "val_history": [],
+            "best_checkpoint": None,
+        }
+
     def compute_log_probs(
         self,
         model,
@@ -443,19 +451,50 @@ class DPOTrainer:
                         recent = epoch_stats[-self.config.logging_steps:]
                         avg_loss = sum(s["loss"] for s in recent) / len(recent)
                         avg_acc = sum(s["accuracy"] for s in recent) / len(recent)
+                        avg_margin = sum(s["reward_margin"] for s in recent) / len(recent)
                         logger.info(
                             f"Step {self.global_step}: loss={avg_loss:.4f}, accuracy={avg_acc:.2f}"
                         )
 
+                        # 记录训练日志
+                        self.training_log["train_history"].append({
+                            "step": self.global_step,
+                            "epoch": epoch + 1,
+                            "loss": avg_loss,
+                            "accuracy": avg_acc,
+                            "reward_margin": avg_margin,
+                        })
+
                     # ✅ 新增：验证逻辑
                     if val_dataset and self.config.eval_steps > 0 and self.global_step % self.config.eval_steps == 0:
                         val_stats = self.evaluate(val_dataset, num_samples=50)  # 验证 50 个样本
+
+                        # 记录验证日志
+                        val_log_entry = {
+                            "step": self.global_step,
+                            "epoch": epoch + 1,
+                            **val_stats,
+                        }
+                        self.training_log["val_history"].append(val_log_entry)
 
                         # 保存最佳模型
                         if val_stats["val_accuracy"] > self.best_val_accuracy:
                             self.best_val_accuracy = val_stats["val_accuracy"]
                             logger.info(f"New best validation accuracy: {self.best_val_accuracy:.2f}")
                             self.save_checkpoint("best")
+
+                            # 记录最佳检查点信息
+                            self.training_log["best_checkpoint"] = {
+                                "step": self.global_step,
+                                "epoch": epoch + 1,
+                                "val_accuracy": self.best_val_accuracy,
+                                "val_loss": val_stats["val_loss"],
+                                "val_reward_margin": val_stats["val_reward_margin"],
+                                "path": os.path.join(self.config.output_dir, "best"),
+                            }
+
+                        # 保存训练日志
+                        self._save_training_log()
 
                     if self.global_step % self.config.save_steps == 0:
                         self.save_checkpoint(f"checkpoint-{self.global_step}")
@@ -467,6 +506,15 @@ class DPOTrainer:
 
         self.save_checkpoint("final")
         logger.info("DPO training completed!")
+
+        # 保存最终训练日志
+        self._save_training_log()
+
+    def _save_training_log(self):
+        """保存训练日志到 JSON 文件"""
+        log_path = os.path.join(self.config.output_dir, "training_log.json")
+        with open(log_path, 'w') as f:
+            json.dump(self.training_log, f, indent=2, default=str)
 
     def save_checkpoint(self, name: str):
         """保存检查点"""

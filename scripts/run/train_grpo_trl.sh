@@ -7,12 +7,12 @@ set -e
 #==========================================
 # 常用参数 - 直接修改这里
 #==========================================
-CUDA_DEVICES=0                    # GPU 编号
-MAX_IMAGE_SIZE=1024                # 图片最大边长
+CUDA_DEVICES=7                    # GPU 编号
+MAX_IMAGE_SIZE=512                 # 图片最大边长 (推荐 384-512，1024 太大会很慢！)
 BATCH_SIZE=1                      # 批次大小
-NUM_GENERATIONS=4                 # 每样本生成数
+NUM_GENERATIONS=4                 # 每样本生成数 (可改为 2 加速，但效果可能略差)
 GRADIENT_ACCUMULATION=4           # 梯度累积
-LORA_R=64                         # LoRA rank
+LORA_R=64                         # LoRA rank (可改为 32 加速)
 NUM_EPOCHS=1                      # 训练轮数
 LEARNING_RATE=5e-6                # 学习率 (GRPO 建议较低)
 
@@ -28,8 +28,8 @@ BETA=0.5                          # KL 惩罚系数 (防止模型偏离太远)
 #==========================================
 # 路径配置
 #==========================================
-MODEL_PATH="./model_cache/Qwen/Qwen3-VL-2B-Instruct"
-SFT_MODEL_PATH="./outputs/qwen3vl_lora"   # SFT 模型路径 (留空从基础模型开始)
+MODEL_PATH="./model_cache/Qwen/Qwen3-VL-8B-Instruct"
+SFT_MODEL_PATH="/mnt/home/wudidi/code_v5/qwen3-vl-det/outputs/qwen3vl_lora_exp3"   # SFT 模型路径 (留空从基础模型开始)
 TRAIN_DATA="data/hefei_last_dataset/qwen_data/train.json"
 VAL_DATA="data/hefei_last_dataset/qwen_data/val.json"  # 验证集路径 (留空则不验证)
 OUTPUT_DIR="outputs/qwen3vl_grpo_trl"
@@ -42,7 +42,7 @@ LORA_DROPOUT=0.1
 MAX_COMPLETION_LENGTH=512
 MAX_PROMPT_LENGTH=1024
 SAVE_STEPS=200
-EVAL_STEPS=200                    # 每多少步验证一次 (0 表示不验证)
+EVAL_STEPS=0                       # 每多少步验证一次 (设为 0 禁用验证以加速训练)
 LOGGING_STEPS=10
 
 # 量化和精度选项

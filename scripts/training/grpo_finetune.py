@@ -511,6 +511,14 @@ class GRPOTrainer:
         self.global_step = 0
         self.best_val_reward = float('-inf')  # 记录最佳验证 reward
 
+        # 训练日志
+        self.training_log = {
+            "config": vars(config),
+            "train_history": [],
+            "val_history": [],
+            "best_checkpoint": None,
+        }
+
     @torch.no_grad()
     def generate_responses(
         self,
@@ -953,15 +961,47 @@ class GRPOTrainer:
                                 f"loss={avg_loss:.4f}, reward={avg_reward:.4f}, kl={avg_kl:.4f}, lr={current_lr:.2e}"
                             )
 
+                            # 记录训练日志
+                            self.training_log["train_history"].append({
+                                "step": self.global_step,
+                                "epoch": epoch + 1,
+                                "samples": total_samples,
+                                "loss": avg_loss,
+                                "reward": avg_reward,
+                                "kl": avg_kl,
+                                "lr": current_lr,
+                            })
+
                     # ✅ 新增：验证逻辑
                     if val_dataset and self.config.eval_steps > 0 and self.global_step % self.config.eval_steps == 0:
                         val_stats = self.evaluate(val_dataset, num_samples=50)  # 验证 50 个样本
+
+                        # 记录验证日志
+                        val_log_entry = {
+                            "step": self.global_step,
+                            "epoch": epoch + 1,
+                            "samples": total_samples,
+                            **val_stats,
+                        }
+                        self.training_log["val_history"].append(val_log_entry)
 
                         # 保存最佳模型
                         if val_stats["val_reward"] > self.best_val_reward:
                             self.best_val_reward = val_stats["val_reward"]
                             logger.info(f"New best validation reward: {self.best_val_reward:.4f}")
                             self.save_checkpoint("best")
+
+                            # 记录最佳检查点信息
+                            self.training_log["best_checkpoint"] = {
+                                "step": self.global_step,
+                                "epoch": epoch + 1,
+                                "samples": total_samples,
+                                "val_reward": self.best_val_reward,
+                                "path": os.path.join(self.config.output_dir, "best"),
+                            }
+
+                        # 保存训练日志
+                        self._save_training_log()
 
                     # 清理显存
                     if self.global_step % 5 == 0:
@@ -995,6 +1035,15 @@ class GRPOTrainer:
         # 保存最终模型
         self.save_checkpoint("final")
         logger.info("GRPO training completed!")
+
+        # 保存最终训练日志
+        self._save_training_log()
+
+    def _save_training_log(self):
+        """保存训练日志到 JSON 文件"""
+        log_path = os.path.join(self.config.output_dir, "training_log.json")
+        with open(log_path, 'w') as f:
+            json.dump(self.training_log, f, indent=2, default=str)
 
     def save_checkpoint(self, name: str):
         """保存检查点"""

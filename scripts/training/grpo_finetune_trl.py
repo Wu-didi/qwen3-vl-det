@@ -682,6 +682,54 @@ def main():
     trainer.save_model(os.path.join(args.output_dir, "final"))
     processor.save_pretrained(os.path.join(args.output_dir, "final"))
 
+    # 保存训练日志
+    training_log = {
+        "config": vars(args),
+        "train_history": [],
+        "val_history": [],
+        "final_metrics": {},
+    }
+
+    # 从 trainer 的日志历史中提取训练指标
+    if hasattr(trainer.state, 'log_history'):
+        for log_entry in trainer.state.log_history:
+            # 训练日志（包含 reward 等 GRPO 特有指标）
+            if 'loss' in log_entry or 'reward' in log_entry:
+                entry = {
+                    "step": log_entry.get('step', 0),
+                    "epoch": log_entry.get('epoch', 0),
+                }
+                # 添加所有可用的指标
+                for key in ['loss', 'reward', 'kl', 'learning_rate']:
+                    if key in log_entry:
+                        entry[key] = log_entry[key]
+
+                if 'eval_' not in str(log_entry):
+                    training_log["train_history"].append(entry)
+
+            # 验证日志
+            if 'eval_reward' in log_entry or 'eval_loss' in log_entry:
+                val_entry = {
+                    "step": log_entry.get('step', 0),
+                    "epoch": log_entry.get('epoch', 0),
+                }
+                for key in log_entry:
+                    if key.startswith('eval_'):
+                        val_entry[key] = log_entry[key]
+                training_log["val_history"].append(val_entry)
+
+    # 保存最终指标
+    if hasattr(trainer.state, 'best_metric'):
+        training_log["final_metrics"]["best_metric"] = trainer.state.best_metric
+    if hasattr(trainer.state, 'best_model_checkpoint'):
+        training_log["final_metrics"]["best_checkpoint"] = trainer.state.best_model_checkpoint
+
+    # 保存到 JSON 文件
+    log_path = os.path.join(args.output_dir, "training_log.json")
+    with open(log_path, 'w') as f:
+        json.dump(training_log, f, indent=2, default=str)
+    logger.info(f"Training log saved to {log_path}")
+
     logger.info(f"Training complete! Model saved to {args.output_dir}/final")
 
 

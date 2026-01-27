@@ -514,6 +514,45 @@ def train(config: FinetuneConfig):
     trainer.save_model()
     processor.save_pretrained(config.output_dir)
 
+    # 保存训练日志
+    training_log = {
+        "config": vars(config),
+        "train_history": [],
+        "val_history": [],
+        "final_metrics": {},
+    }
+
+    # 从 trainer 的日志历史中提取训练指标
+    if hasattr(trainer.state, 'log_history'):
+        for log_entry in trainer.state.log_history:
+            if 'loss' in log_entry and 'epoch' in log_entry:
+                # 训练日志
+                training_log["train_history"].append({
+                    "step": log_entry.get('step', 0),
+                    "epoch": log_entry.get('epoch', 0),
+                    "loss": log_entry.get('loss', 0),
+                    "learning_rate": log_entry.get('learning_rate', 0),
+                })
+            elif 'eval_loss' in log_entry:
+                # 验证日志
+                training_log["val_history"].append({
+                    "step": log_entry.get('step', 0),
+                    "epoch": log_entry.get('epoch', 0),
+                    "eval_loss": log_entry.get('eval_loss', 0),
+                })
+
+    # 保存最终指标
+    if hasattr(trainer.state, 'best_metric'):
+        training_log["final_metrics"]["best_metric"] = trainer.state.best_metric
+    if hasattr(trainer.state, 'best_model_checkpoint'):
+        training_log["final_metrics"]["best_checkpoint"] = trainer.state.best_model_checkpoint
+
+    # 保存到 JSON 文件
+    log_path = os.path.join(config.output_dir, "training_log.json")
+    with open(log_path, 'w') as f:
+        json.dump(training_log, f, indent=2, default=str)
+    logger.info(f"Training log saved to {log_path}")
+
     logger.info("Fine-tuning completed!")
 
 
