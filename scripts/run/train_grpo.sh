@@ -39,6 +39,8 @@ MAX_LENGTH=2048
 DISABLE_4BIT=false                # 设为 true 关闭 4bit (默认开启)
 SAVE_STEPS=200                    # 每处理多少个样本保存一次检查点
 EVAL_STEPS=200                    # 每多少步验证一次 (0 表示不验证)
+USABILITY_CHECK_STEPS=200         # 每多少步进行可用性自检 (0 表示禁用)
+USABILITY_CHECK_SAMPLES=8         # 可用性自检的抽样数量
 LOGGING_STEPS=10
 
 #==========================================
@@ -87,6 +89,8 @@ CMD="python scripts/training/grpo_finetune.py \
     --max_length $MAX_LENGTH \
     --save_steps $SAVE_STEPS \
     --eval_steps $EVAL_STEPS \
+    --usability_check_steps $USABILITY_CHECK_STEPS \
+    --usability_check_samples $USABILITY_CHECK_SAMPLES \
     --logging_steps $LOGGING_STEPS"
 
 if [ "$DISABLE_4BIT" = "true" ]; then

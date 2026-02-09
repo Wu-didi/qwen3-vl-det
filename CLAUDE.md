@@ -41,6 +41,19 @@ TRAIN_DATA=data/qwen_data/train.json NUM_EPOCHS=5 ./scripts/run/train_lora.sh
 # GRPO 强化学习微调
 ./scripts/run/train_grpo.sh
 TRAIN_DATA=data/qwen_data/train.json NUM_GENERATIONS=6 ./scripts/run/train_grpo.sh
+
+# 评估模型
+./scripts/run/evaluate.sh
+MODEL_PATH=outputs/qwen3vl_lora TEST_DATA=data/qwen_data/test.json ./scripts/run/evaluate.sh
+COMPUTE_MAP=true ./scripts/run/evaluate.sh  # 计算 mAP
+
+# 可视化评估结果
+./scripts/run/visualize_eval.sh
+EVAL_DIR=eval_results/lora ./scripts/run/visualize_eval.sh
+
+# 比较多个模型
+./scripts/run/compare_models.sh
+EVAL_DIRS="eval_results/base eval_results/lora" LABELS="Base LoRA" ./scripts/run/compare_models.sh
 ```
 
 ### Development
@@ -112,6 +125,30 @@ python scripts/inference/infer.py \
 python scripts/visualize_training_log.py \
     --log outputs/qwen3vl_grpo/training_log.json \
     --output plots/
+
+# Evaluate model on test set
+python scripts/evaluate.py \
+    --model_path outputs/qwen3vl_lora \
+    --test_data data/qwen_data/test.json \
+    --output_dir eval_results/
+
+# Evaluate with multiple IoU thresholds (compute mAP)
+python scripts/evaluate.py \
+    --model_path outputs/qwen3vl_lora \
+    --test_data data/qwen_data/test.json \
+    --iou_thresholds 0.5 0.75 0.9 \
+    --output_dir eval_results/
+
+# Visualize evaluation results
+python scripts/visualize_eval_results.py \
+    --eval_dir eval_results/ \
+    --output plots/eval_plots.png
+
+# Compare multiple models
+python scripts/visualize_eval_results.py \
+    --eval_dirs eval_results/base eval_results/lora eval_results/grpo \
+    --labels "Base" "LoRA" "GRPO" \
+    --output plots/model_comparison.png
 ```
 
 ### Docker
@@ -155,17 +192,28 @@ scripts/                     # 脚本工具
 │   ├── infer.sh             # 推理
 │   ├── infer_finetuned.sh   # 微调模型推理
 │   ├── convert_data.sh      # 数据转换
-│   └── download_model.sh    # 下载模型
+│   ├── download_model.sh    # 下载模型
+│   ├── evaluate.sh          # 模型评估
+│   ├── visualize_eval.sh    # 可视化评估结果
+│   └── compare_models.sh    # 比较多个模型
 ├── training/                # 训练脚本
 │   ├── finetune_qwen_vl.py  # LoRA/QLoRA 监督微调
-│   └── grpo_finetune.py     # GRPO 强化学习微调
+│   ├── grpo_finetune.py     # GRPO 强化学习微调
+│   └── dpo_finetune.py      # DPO 微调
 ├── data/                    # 数据处理
 │   └── cvat_to_qwenvl.py    # CVAT -> Qwen-VL 格式转换
 ├── inference/               # 推理脚本
 │   ├── infer.py             # 独立推理脚本
 │   └── inference_finetuned.py # 微调模型推理
+├── evaluate.py              # 目标检测评估（Precision/Recall/F1/mAP）
+├── visualize_eval_results.py # 评估结果可视化
+├── visualize_training_log.py # 训练日志可视化
 ├── benchmark.py             # 性能测试
 └── download_model.py        # 模型下载
+
+docs/                        # 文档
+├── EVALUATION.md            # 评估指南（详细说明）
+└── data_preparation_plan.md # 数据准备计划
 
 tests/                       # 测试用例
 examples/                    # 示例图片
@@ -182,6 +230,7 @@ gradio_app.py                # Gradio Web UI
 6. **GRPO Training**: Reward based on format correctness, bbox IoU, category accuracy; uses KL divergence penalty
 7. **Validation**: All training scripts support validation on held-out data; best models saved based on validation metrics
 8. **Training Logs**: All training scripts automatically save detailed logs to `training_log.json` for analysis and visualization
+9. **Usability Check**: GRPO training includes periodic usability self-checks to verify actual model output quality beyond reward metrics
 
 ## Training & Validation
 
@@ -192,6 +241,52 @@ All training scripts now support validation during training:
 - **LoRA/QLoRA** (`finetune_qwen_vl.py`): Validates every 500 steps, tracks validation loss
 - **GRPO** (`grpo_finetune.py`): Validates every 200 steps, tracks reward/format/bbox/category metrics
 - **DPO** (`dpo_finetune.py`): Validates every 500 steps, tracks loss/accuracy/reward_margin
+
+### Usability Self-Check (GRPO Only)
+
+GRPO training includes a **usability self-check** mechanism to prevent "fake training" where reward increases but model outputs remain unusable.
+
+**What it does**:
+- Every N steps (default: 200), randomly samples 8 examples
+- Generates responses and parses them using actual detection logic
+- Computes real-world metrics:
+  - Parse success rate (can extract valid boxes?)
+  - Format completeness (has box tags, numbering, status?)
+  - Average IoU (localization accuracy)
+  - Category accuracy (correct classification)
+  - Anomaly detection accuracy (normal vs abnormal)
+
+**Why it matters**:
+- Reward curves can be misleading - model might optimize reward without producing usable outputs
+- Usability check validates that the model actually generates parseable, accurate detections
+- Catches issues like: format degradation, coordinate drift, category confusion
+
+**Configuration**:
+```bash
+# Enable usability check (default)
+python scripts/training/grpo_finetune.py \
+    --train_data data.json \
+    --usability_check_steps 200 \
+    --usability_check_samples 8
+
+# Disable usability check
+python scripts/training/grpo_finetune.py \
+    --train_data data.json \
+    --usability_check_steps 0
+
+# In shell scripts
+USABILITY_CHECK_STEPS=200 ./scripts/run/train_grpo.sh
+```
+
+**Log output**:
+Usability metrics are saved to `training_log.json` under `usability_history`:
+- `usability_parse_success_rate`: % of samples with valid box extraction
+- `usability_has_box_rate`: % with `<box>` tags
+- `usability_has_numbered_rate`: % with numbered format
+- `usability_has_status_rate`: % with status field
+- `usability_avg_iou`: Average IoU with ground truth
+- `usability_category_accuracy`: Category matching accuracy
+- `usability_anomaly_accuracy`: Anomaly detection accuracy
 
 ### Training Logs
 

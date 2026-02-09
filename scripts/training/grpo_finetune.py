@@ -103,13 +103,20 @@ class GRPOConfig:
     logging_steps: int = 10
     save_steps: int = 200
     eval_steps: int = 200  # 每多少步验证一次
+    usability_check_steps: int = 200  # 每多少步进行可用性自检（0 表示禁用）
+    usability_check_samples: int = 8  # 可用性自检的抽样数量
     max_grad_norm: float = 1.0
 
-    # Reward weights
-    reward_format_weight: float = 1.0  # 格式正确性权重
-    reward_bbox_weight: float = 2.0    # 边界框准确性权重
-    reward_category_weight: float = 1.5  # 类别准确性权重
-    reward_confidence_weight: float = 0.5  # 置信度校准权重
+    # Reward weights (strict gating design)
+    # - format: acts as STRICT GATE - if format invalid (0), all other rewards forced to 0
+    # - bbox: high weight (3.0) for accurate localization (only active when format valid)
+    # - category: medium weight (2.0) for correct classification (only active when format valid)
+    # - completeness: medium weight (2.0) for detection completeness (only active when format valid)
+    # Note: format_weight can be low since gating is enforced by early return, not by weight
+    reward_format_weight: float = 0.2  # 格式正确性权重 (strict gate)
+    reward_bbox_weight: float = 3.0    # 边界框准确性权重
+    reward_category_weight: float = 2.0  # 类别准确性权重
+    reward_confidence_weight: float = 2.0  # 完整性权重
 
     # Other
     seed: int = 42
@@ -148,12 +155,15 @@ class RewardCalculator:
             status_match = re.search(r'状态[：:]\s*([^\n]+)', item)
             status = status_match.group(1).strip() if status_match else "正常"
 
-            # 提取坐标
-            box_match = re.search(r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>', item)
+            # 提取坐标 (支持浮点数和负数)
+            box_match = re.search(
+                r'<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>',
+                item
+            )
             if not box_match:
                 continue
 
-            x1, y1, x2, y2 = int(box_match.group(1)), int(box_match.group(2)), int(box_match.group(3)), int(box_match.group(4))
+            x1, y1, x2, y2 = int(float(box_match.group(1))), int(float(box_match.group(2))), int(float(box_match.group(3))), int(float(box_match.group(4)))
 
             # 判断是否异常
             is_anomaly = any(kw in status for kw in ["异常", "全灭", "损坏", "故障", "破损", "不亮", "错误", "黑屏", "全亮"])
@@ -165,20 +175,20 @@ class RewardCalculator:
                 "bbox": [x1, y1, x2, y2]
             })
 
-        # 如果上面没匹配到，尝试只提取 box 坐标
+        # 如果上面没匹配到，尝试只提取 box 坐标 (支持浮点数和负数)
         if not detections:
-            box_pattern = r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>'
+            box_pattern = r'<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>'
             simple_matches = re.findall(box_pattern, text)
             for match in simple_matches:
                 try:
-                    x1, y1, x2, y2 = int(match[0]), int(match[1]), int(match[2]), int(match[3])
+                    x1, y1, x2, y2 = int(float(match[0])), int(float(match[1])), int(float(match[2])), int(float(match[3]))
                     detections.append({
                         "category": "unknown",
                         "status": "unknown",
                         "is_anomaly": False,
                         "bbox": [x1, y1, x2, y2]
                     })
-                except ValueError:
+                except (ValueError, TypeError):
                     continue
 
         return detections
@@ -230,16 +240,20 @@ class RewardCalculator:
         pred_detections = self.parse_box_format(generated_text)
         gt_detections = ground_truth.get("detections", [])
 
-        # 1. 格式正确性奖励
+        # 1. 格式正确性奖励 (作为 gating 机制)
+        # 检查是否有完整的检测格式：序号 + 状态 + box
         has_box = len(pred_detections) > 0
-        has_structure = "检测到" in generated_text or "未检测到" in generated_text
+        has_numbered = bool(re.search(r'\d+\.\s+\S+', generated_text))
+        has_status = bool(re.search(r'状态[：:]\s*\S+', generated_text))
 
-        if has_box or has_structure:
-            rewards["format"] = 1.0
-        elif generated_text.strip():
-            rewards["format"] = 0.3  # 有输出但格式不对
+        # Gating: 只有格式完整才给奖励，否则为 0
+        format_valid = has_box and has_numbered and has_status
+        if format_valid:
+            rewards["format"] = 1.0  # 格式正确，允许其他奖励生效
         else:
-            rewards["format"] = -1.0  # 空输出
+            rewards["format"] = 0.0  # 格式不完整，作为 gate 阻止其他奖励
+            # ✅ 严格门控：格式不对时，直接返回全零奖励
+            return 0.0, rewards
 
         # 如果没有真实检测
         if not gt_detections:
@@ -434,12 +448,15 @@ class GRPODataset(Dataset):
             status_match = re.search(r'状态[：:]\s*([^\n]+)', item)
             status = status_match.group(1).strip() if status_match else "正常"
 
-            # 提取坐标
-            box_match = re.search(r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>', item)
+            # 提取坐标 (支持浮点数和负数)
+            box_match = re.search(
+                r'<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>',
+                item
+            )
             if not box_match:
                 continue
 
-            x1, y1, x2, y2 = int(box_match.group(1)), int(box_match.group(2)), int(box_match.group(3)), int(box_match.group(4))
+            x1, y1, x2, y2 = int(float(box_match.group(1))), int(float(box_match.group(2))), int(float(box_match.group(3))), int(float(box_match.group(4)))
 
             is_anomaly = any(kw in status for kw in ["异常", "全灭", "损坏", "故障", "破损", "不亮", "错误", "黑屏", "全亮"])
 
@@ -516,6 +533,7 @@ class GRPOTrainer:
             "config": vars(config),
             "train_history": [],
             "val_history": [],
+            "usability_history": [],  # 可用性自检历史
             "best_checkpoint": None,
         }
 
@@ -801,6 +819,145 @@ class GRPOTrainer:
         }
 
     @torch.no_grad()
+    def usability_check(self, dataset: GRPODataset, num_samples: int = 8) -> Dict[str, float]:
+        """可用性自检：抽样推理并统计实际可用性指标
+
+        这个方法比单纯的 reward 更能反映模型的实际可用性，避免被"假训练"误导。
+
+        Args:
+            dataset: 数据集（训练集或验证集）
+            num_samples: 抽样数量
+
+        Returns:
+            可用性指标字典
+        """
+        logger.info(f"Running usability check on {num_samples} samples...")
+        self.model.eval()
+
+        # 随机抽样
+        import random
+        indices = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
+
+        usability_stats = {
+            "parse_success": 0,  # 成功解析出 box 的样本数
+            "has_box": 0,  # 包含 <box> 标签的样本数
+            "has_numbered": 0,  # 包含序号的样本数
+            "has_status": 0,  # 包含状态的样本数
+            "total_pred_boxes": 0,  # 预测的总 box 数
+            "total_gt_boxes": 0,  # ground truth 总 box 数
+            "iou_sum": 0.0,  # IoU 总和
+            "iou_count": 0,  # 有效 IoU 计数
+            "category_match": 0,  # 类别匹配数
+            "category_total": 0,  # 类别总数
+            "anomaly_correct": 0,  # 异常状态判断正确数
+            "anomaly_total": 0,  # 异常状态总数
+        }
+
+        for idx in indices:
+            sample = dataset[idx]
+            image = sample["image"]
+            prompt = sample["prompt"]
+            ground_truth = sample["ground_truth"]
+
+            # 生成响应
+            try:
+                responses = self.generate_responses(image, prompt, num_generations=1)
+                response = responses[0]
+            except Exception as e:
+                logger.warning(f"Generation failed for sample {idx}: {e}")
+                continue
+
+            # 解析生成的文本
+            pred_detections = self.reward_calculator.parse_box_format(response)
+            gt_detections = ground_truth.get("detections", [])
+
+            # 统计格式正确性
+            has_box = bool(re.search(r'<box>.*?</box>', response))
+            has_numbered = bool(re.search(r'\d+\.\s+\S+', response))
+            has_status = bool(re.search(r'状态[：:]\s*\S+', response))
+
+            if has_box:
+                usability_stats["has_box"] += 1
+            if has_numbered:
+                usability_stats["has_numbered"] += 1
+            if has_status:
+                usability_stats["has_status"] += 1
+
+            # 解析成功：至少有一个完整的检测结果
+            if pred_detections and len(pred_detections) > 0:
+                usability_stats["parse_success"] += 1
+                usability_stats["total_pred_boxes"] += len(pred_detections)
+
+            usability_stats["total_gt_boxes"] += len(gt_detections)
+
+            # 计算 IoU 和类别匹配
+            if gt_detections and pred_detections:
+                for gt_det in gt_detections:
+                    gt_bbox = gt_det.get("bbox", [])
+                    gt_category = gt_det.get("category", "")
+                    gt_is_anomaly = gt_det.get("is_anomaly", False)
+
+                    best_iou = 0.0
+                    best_pred = None
+
+                    for pred_det in pred_detections:
+                        pred_bbox = pred_det.get("bbox", [])
+                        if gt_bbox and pred_bbox:
+                            iou = self.reward_calculator.compute_iou(gt_bbox, pred_bbox)
+                            if iou > best_iou:
+                                best_iou = iou
+                                best_pred = pred_det
+
+                    if best_iou > 0:
+                        usability_stats["iou_sum"] += best_iou
+                        usability_stats["iou_count"] += 1
+
+                        # 类别匹配（IoU > 0.5 才算有效匹配）
+                        if best_iou > 0.5 and best_pred:
+                            usability_stats["category_total"] += 1
+                            pred_category = best_pred.get("category", "")
+                            # 模糊匹配
+                            if (gt_category in pred_category or
+                                pred_category in gt_category or
+                                gt_category == pred_category):
+                                usability_stats["category_match"] += 1
+
+                            # 异常状态判断
+                            usability_stats["anomaly_total"] += 1
+                            pred_is_anomaly = best_pred.get("is_anomaly", False)
+                            if gt_is_anomaly == pred_is_anomaly:
+                                usability_stats["anomaly_correct"] += 1
+
+        # 计算百分比指标
+        total_samples = len(indices)
+        results = {
+            "usability_parse_success_rate": usability_stats["parse_success"] / total_samples if total_samples > 0 else 0.0,
+            "usability_has_box_rate": usability_stats["has_box"] / total_samples if total_samples > 0 else 0.0,
+            "usability_has_numbered_rate": usability_stats["has_numbered"] / total_samples if total_samples > 0 else 0.0,
+            "usability_has_status_rate": usability_stats["has_status"] / total_samples if total_samples > 0 else 0.0,
+            "usability_avg_iou": usability_stats["iou_sum"] / usability_stats["iou_count"] if usability_stats["iou_count"] > 0 else 0.0,
+            "usability_category_accuracy": usability_stats["category_match"] / usability_stats["category_total"] if usability_stats["category_total"] > 0 else 0.0,
+            "usability_anomaly_accuracy": usability_stats["anomaly_correct"] / usability_stats["anomaly_total"] if usability_stats["anomaly_total"] > 0 else 0.0,
+            "usability_avg_pred_boxes": usability_stats["total_pred_boxes"] / total_samples if total_samples > 0 else 0.0,
+            "usability_avg_gt_boxes": usability_stats["total_gt_boxes"] / total_samples if total_samples > 0 else 0.0,
+        }
+
+        logger.info(
+            f"Usability check results:\n"
+            f"  Parse success: {results['usability_parse_success_rate']:.1%} ({usability_stats['parse_success']}/{total_samples})\n"
+            f"  Has <box>: {results['usability_has_box_rate']:.1%}\n"
+            f"  Has numbered: {results['usability_has_numbered_rate']:.1%}\n"
+            f"  Has status: {results['usability_has_status_rate']:.1%}\n"
+            f"  Avg IoU: {results['usability_avg_iou']:.3f} (n={usability_stats['iou_count']})\n"
+            f"  Category accuracy: {results['usability_category_accuracy']:.1%} ({usability_stats['category_match']}/{usability_stats['category_total']})\n"
+            f"  Anomaly accuracy: {results['usability_anomaly_accuracy']:.1%} ({usability_stats['anomaly_correct']}/{usability_stats['anomaly_total']})\n"
+            f"  Avg pred boxes: {results['usability_avg_pred_boxes']:.1f}, Avg GT boxes: {results['usability_avg_gt_boxes']:.1f}"
+        )
+
+        self.model.train()
+        return results
+
+    @torch.no_grad()
     def evaluate(self, val_dataset: GRPODataset, num_samples: int = None) -> Dict[str, float]:
         """在验证集上评估模型
 
@@ -999,6 +1156,30 @@ class GRPOTrainer:
                                 "val_reward": self.best_val_reward,
                                 "path": os.path.join(self.config.output_dir, "best"),
                             }
+
+                        # 保存训练日志
+                        self._save_training_log()
+
+                    # ✅ 新增：可用性自检（比 reward 更能说明"能不能用"）
+                    if self.config.usability_check_steps > 0 and self.global_step % self.config.usability_check_steps == 0:
+                        # 优先在验证集上检查，如果没有验证集则在训练集上检查
+                        check_dataset = val_dataset if val_dataset else dataset
+                        usability_stats = self.usability_check(
+                            check_dataset,
+                            num_samples=self.config.usability_check_samples
+                        )
+
+                        # 记录可用性自检日志
+                        usability_log_entry = {
+                            "step": self.global_step,
+                            "epoch": epoch + 1,
+                            "samples": total_samples,
+                            "dataset": "val" if val_dataset else "train",
+                            **usability_stats,
+                        }
+                        if "usability_history" not in self.training_log:
+                            self.training_log["usability_history"] = []
+                        self.training_log["usability_history"].append(usability_log_entry)
 
                         # 保存训练日志
                         self._save_training_log()
@@ -1212,6 +1393,10 @@ def main():
     parser.add_argument("--save_steps", type=int, default=200)
     parser.add_argument("--eval_steps", type=int, default=200,
                         help="Evaluate every N steps (0 to disable)")
+    parser.add_argument("--usability_check_steps", type=int, default=200,
+                        help="Run usability check every N steps (0 to disable)")
+    parser.add_argument("--usability_check_samples", type=int, default=8,
+                        help="Number of samples for usability check")
 
     # Other
     parser.add_argument("--seed", type=int, default=42)
@@ -1244,6 +1429,8 @@ def main():
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         eval_steps=args.eval_steps,
+        usability_check_steps=args.usability_check_steps,
+        usability_check_samples=args.usability_check_samples,
         seed=args.seed,
         bf16=args.bf16,
     )

@@ -54,13 +54,14 @@ def scan_finetuned_models() -> dict:
         config_path = os.path.join(model_path, "finetune_config.json")
         adapter_config_path = os.path.join(model_path, "adapter_config.json")
         grpo_config_path = os.path.join(model_path, "grpo_config.json")
+        training_config_path = os.path.join(model_path, "training_config.json")
 
         # 检查是否有 LoRA/GRPO 配置文件
         if os.path.isdir(model_path) and (
-            os.path.exists(config_path) or os.path.exists(adapter_config_path) or os.path.exists(grpo_config_path)
+            os.path.exists(config_path) or os.path.exists(adapter_config_path) or os.path.exists(grpo_config_path) or os.path.exists(training_config_path)
         ):
             # 根据配置文件类型标识模型
-            if os.path.exists(grpo_config_path):
+            if os.path.exists(grpo_config_path) or os.path.exists(training_config_path):
                 # GRPO 模型：查找最新的 checkpoint
                 actual_path = get_latest_checkpoint(model_path)
                 display_name = f"🔧 {name} (GRPO)"
@@ -109,8 +110,21 @@ def is_finetuned_model(model_choice: str) -> bool:
 
 def get_base_model_path(finetuned_path: str) -> str:
     """从微调模型配置中获取基础模型路径"""
-    config_path = os.path.join(finetuned_path, "finetune_config.json")
+    # 如果是 checkpoint 子目录，先尝试从父目录读取配置
+    parent_dir = os.path.dirname(finetuned_path) if "checkpoint-" in finetuned_path else finetuned_path
 
+    # 尝试从 training_config.json 读取（GRPO TRL 训练）
+    training_config_path = os.path.join(parent_dir, "training_config.json")
+    if os.path.exists(training_config_path):
+        try:
+            with open(training_config_path) as f:
+                config = json.load(f)
+                return config.get("model_path", "./model_cache/Qwen/Qwen3-VL-2B-Instruct")
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # 尝试从 finetune_config.json 读取
+    config_path = os.path.join(finetuned_path, "finetune_config.json")
     if os.path.exists(config_path):
         try:
             with open(config_path) as f:
@@ -292,12 +306,15 @@ def parse_box_format(text: str) -> dict:
         reason_match = re.search(r'原因[：:]\s*([^\n]+)', item)
         reason = reason_match.group(1).strip() if reason_match else ""
 
-        # 提取坐标
-        box_match = re.search(r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>', item)
+        # 提取坐标 (支持浮点数和负数)
+        box_match = re.search(
+            r'<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>',
+            item
+        )
         if not box_match:
             continue
 
-        x1, y1, x2, y2 = int(box_match.group(1)), int(box_match.group(2)), int(box_match.group(3)), int(box_match.group(4))
+        x1, y1, x2, y2 = int(float(box_match.group(1))), int(float(box_match.group(2))), int(float(box_match.group(3))), int(float(box_match.group(4)))
 
         # 判断是否异常
         is_anomaly = any(kw in status for kw in ["异常", "全灭", "损坏", "故障", "破损", "不亮", "错误", "黑屏", "全亮"])

@@ -67,6 +67,7 @@ def get_model_class(model_path: str):
 def format_reward(completions: List[str], **kwargs) -> List[float]:
     """
     Reward function that checks if the completion has proper format.
+    Acts as a gating function: returns 0 if format is invalid, 1 if valid.
 
     Expected format:
     1. 设备类别
@@ -76,10 +77,11 @@ def format_reward(completions: List[str], **kwargs) -> List[float]:
     rewards = []
 
     for completion in completions:
-        reward = 0.0
-
-        # Check for box format
-        has_box = bool(re.search(r'<box>\s*\(\d+\s*,\s*\d+\)\s*,\s*\(\d+\s*,\s*\d+\)\s*</box>', completion))
+        # Check for box format (updated to support floats and negative numbers)
+        has_box = bool(re.search(
+            r'<box>\s*\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\)\s*,\s*\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\)\s*</box>',
+            completion
+        ))
 
         # Check for numbered list format
         has_numbered = bool(re.search(r'\d+\.\s+\S+', completion))
@@ -87,16 +89,12 @@ def format_reward(completions: List[str], **kwargs) -> List[float]:
         # Check for status
         has_status = bool(re.search(r'状态[：:]\s*\S+', completion))
 
+        # Gating: only reward if format is correct
+        # Perfect format required: all three components present
         if has_box and has_numbered and has_status:
-            reward = 1.0  # Perfect format
-        elif has_box and (has_numbered or has_status):
-            reward = 0.7  # Good format
-        elif has_box:
-            reward = 0.5  # Has detection
-        elif completion.strip():
-            reward = 0.1  # Has some output
+            reward = 1.0  # Valid format - allows other rewards to count
         else:
-            reward = 0.0  # Empty
+            reward = 0.0  # Invalid format - gates other rewards
 
         rewards.append(reward)
 
@@ -208,14 +206,16 @@ def status_accuracy_reward(completions: List[str], assistant: List[str], **kwarg
 # ============ Helper Functions ============
 
 def _extract_boxes(text: str) -> List[List[int]]:
-    """Extract bounding boxes from text."""
+    """Extract bounding boxes from text. Supports integers, floats, and negative numbers."""
     boxes = []
-    pattern = r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>'
+    # Updated pattern: supports floats, negative numbers, and flexible whitespace
+    pattern = r'<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>'
     for match in re.finditer(pattern, text):
         try:
-            box = [int(match.group(i)) for i in range(1, 5)]
+            # Convert to int (round floats)
+            box = [int(float(match.group(i))) for i in range(1, 5)]
             boxes.append(box)
-        except ValueError:
+        except (ValueError, TypeError):
             continue
     return boxes
 
@@ -608,8 +608,13 @@ def main():
         status_accuracy_reward,
     ]
 
-    # Reward weights (format:1, bbox:2, category:1, status:1)
-    reward_weights = [1.0, 2.0, 1.0, 1.0]
+    # Reward weights with gating design:
+    # - format_reward: low weight (0.2) but acts as gate (0 or 1)
+    # - bbox_iou_reward: high weight (3.0) for accurate localization
+    # - category_match_reward: medium weight (2.0) for correct classification
+    # - status_accuracy_reward: medium weight (2.0) for anomaly detection
+    # Total max reward: 0.2 + 3.0 + 2.0 + 2.0 = 7.2
+    reward_weights = [0.2, 3.0, 2.0, 2.0]
 
     # Setup logging
     if args.use_wandb:

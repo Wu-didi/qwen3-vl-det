@@ -43,24 +43,25 @@ logger = logging.getLogger(__name__)
 
 
 def parse_box_format(text: str) -> List[Dict]:
-    """解析 <box>(x1,y1),(x2,y2)</box> 格式"""
+    """解析 <box>(x1,y1),(x2,y2)</box> 格式 (支持浮点数和负数)"""
     detections = []
 
-    item_pattern = r'(\d+)\.\s*([^\n]+).*?(?:状态[：:]\s*([^\n]+))?.*?<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>'
+    # Updated pattern: supports floats and negative numbers
+    item_pattern = r'(\d+)\.\s*([^\n]+).*?(?:状态[：:]\s*([^\n]+))?.*?<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>'
     matches = re.findall(item_pattern, text, re.DOTALL)
 
     for match in matches:
         try:
             category = match[1].strip()
             status = match[2].strip() if match[2] else "正常"
-            x1, y1, x2, y2 = int(match[3]), int(match[4]), int(match[5]), int(match[6])
+            x1, y1, x2, y2 = int(float(match[3])), int(float(match[4])), int(float(match[5])), int(float(match[6]))
 
             detections.append({
                 "category": category,
                 "status": status,
                 "bbox": [x1, y1, x2, y2]
             })
-        except (ValueError, IndexError):
+        except (ValueError, IndexError, TypeError):
             continue
 
     return detections

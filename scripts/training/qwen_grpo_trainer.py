@@ -278,10 +278,11 @@ class QwenVLGRPOTrainer(GRPOTrainer):
         if self.scale_rewards != "none":
             advantages = advantages / (std_rewards + 1e-4)
 
-        # Slice to local part
+        # Slice to local part (must account for num_generations)
+        local_n = len(prompts) * self.num_generations
         process_slice = slice(
-            self.accelerator.process_index * len(prompts),
-            (self.accelerator.process_index + 1) * len(prompts),
+            self.accelerator.process_index * local_n,
+            (self.accelerator.process_index + 1) * local_n,
         )
         advantages = advantages[process_slice]
 
