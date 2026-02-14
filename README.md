@@ -123,6 +123,23 @@ pip install -r requirements_finetune.txt
 ./scripts/run/train_grpo_trl.sh
 ```
 
+默认启用 `risk_aware` 奖励（实例级一对一匹配 + 漏检/误检风险惩罚 + 异常识别奖励）。
+
+可用于消融对比：
+
+```bash
+# 切回旧版奖励
+REWARD_SCHEME=legacy ./scripts/run/train_grpo_trl.sh
+
+# 使用风险感知奖励并调参
+REWARD_SCHEME=risk_aware \
+REWARD_MATCH_IOU=0.5 \
+REWARD_W_SET_F1=3.0 \
+REWARD_W_RISK=2.5 \
+REWARD_W_ANOMALY=2.0 \
+./scripts/run/train_grpo_trl.sh
+```
+
 可选：自定义实现版本
 
 ```bash

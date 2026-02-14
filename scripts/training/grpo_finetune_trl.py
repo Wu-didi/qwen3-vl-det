@@ -15,8 +15,8 @@ import os
 import re
 import json
 import logging
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any, Tuple
 
 import torch
 from PIL import Image
@@ -56,6 +56,29 @@ BOX_PATTERN = (
     r"<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*"
     r"\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>"
 )
+
+ANOMALY_KEYWORDS = ["异常", "全灭", "损坏", "故障", "破损", "不亮", "错误", "黑屏", "全亮"]
+
+
+@dataclass
+class ParsedDetection:
+    """Structured detection parsed from text."""
+    category: str
+    status: str
+    is_anomaly: bool
+    bbox: List[int]
+
+
+@dataclass
+class RiskRewardConfig:
+    """Config for risk-aware GRPO rewards."""
+    match_iou_threshold: float = 0.5
+    hallucination_unit_penalty: float = 0.35
+    no_detection_missing_penalty: float = 0.2
+    omission_penalty: float = 1.0
+
+
+RISK_REWARD_CFG = RiskRewardConfig()
 
 
 def _is_no_detection_response(text: str) -> bool:
@@ -254,6 +277,255 @@ def status_accuracy_reward(completions: List[str], assistant: List[str], **kwarg
     return rewards
 
 
+def set_f1_reward(completions: List[str], assistant: List[str], **kwargs) -> List[float]:
+    """Set-level detection reward based on one-to-one TP/FP/FN F1."""
+    rewards: List[float] = []
+
+    for completion, gt_response in zip(completions, assistant):
+        if not _is_format_valid(completion, gt_response):
+            rewards.append(0.0)
+            continue
+
+        pred_dets = _extract_detections(completion)
+        gt_dets = _extract_detections(gt_response)
+        pred_count = len(pred_dets)
+        gt_count = len(gt_dets)
+
+        if gt_count == 0:
+            if pred_count == 0 and _is_no_detection_response(completion):
+                rewards.append(1.0)
+            elif pred_count == 0:
+                rewards.append(max(0.0, 1.0 - RISK_REWARD_CFG.no_detection_missing_penalty))
+            else:
+                rewards.append(0.0)
+            continue
+
+        matches = _match_detections(
+            pred_dets,
+            gt_dets,
+            iou_threshold=RISK_REWARD_CFG.match_iou_threshold,
+            require_category=True,
+        )
+        tp = len(matches)
+        fp = max(pred_count - tp, 0)
+        fn = max(gt_count - tp, 0)
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        rewards.append(_safe_f1(precision, recall))
+
+    return rewards
+
+
+def localization_quality_reward(
+    completions: List[str], assistant: List[str], **kwargs
+) -> List[float]:
+    """Localization quality using IoU over matched pairs."""
+    rewards: List[float] = []
+    iou_thr = RISK_REWARD_CFG.match_iou_threshold
+    denom = max(1e-6, 1.0 - iou_thr)
+
+    for completion, gt_response in zip(completions, assistant):
+        if not _is_format_valid(completion, gt_response):
+            rewards.append(0.0)
+            continue
+
+        pred_dets = _extract_detections(completion)
+        gt_dets = _extract_detections(gt_response)
+
+        if not gt_dets:
+            if not pred_dets and _is_no_detection_response(completion):
+                rewards.append(1.0)
+            elif not pred_dets:
+                rewards.append(max(0.0, 1.0 - RISK_REWARD_CFG.no_detection_missing_penalty))
+            else:
+                rewards.append(0.0)
+            continue
+
+        matches = _match_detections(
+            pred_dets,
+            gt_dets,
+            iou_threshold=iou_thr,
+            require_category=True,
+        )
+
+        if not matches:
+            rewards.append(0.0)
+            continue
+
+        mean_iou = sum(m["iou"] for m in matches) / len(matches)
+        norm_iou = max(0.0, min(1.0, (mean_iou - iou_thr) / denom))
+        rewards.append(norm_iou)
+
+    return rewards
+
+
+def count_alignment_reward(completions: List[str], assistant: List[str], **kwargs) -> List[float]:
+    """Reward count consistency and penalize severe over/under-prediction."""
+    rewards: List[float] = []
+
+    for completion, gt_response in zip(completions, assistant):
+        if not _is_format_valid(completion, gt_response):
+            rewards.append(0.0)
+            continue
+
+        pred_count = len(_extract_detections(completion))
+        gt_count = len(_extract_detections(gt_response))
+
+        if gt_count == 0:
+            if pred_count == 0 and _is_no_detection_response(completion):
+                rewards.append(1.0)
+            elif pred_count == 0:
+                rewards.append(max(0.0, 1.0 - RISK_REWARD_CFG.no_detection_missing_penalty))
+            else:
+                penalty = min(1.0, pred_count * RISK_REWARD_CFG.hallucination_unit_penalty)
+                rewards.append(-penalty)
+            continue
+
+        if _is_no_detection_response(completion) and pred_count == 0:
+            rewards.append(-min(1.0, RISK_REWARD_CFG.omission_penalty))
+            continue
+
+        ratio_err = abs(pred_count - gt_count) / max(gt_count, 1)
+        rewards.append(max(-1.0, min(1.0, 1.0 - ratio_err)))
+
+    return rewards
+
+
+def risk_control_reward(completions: List[str], assistant: List[str], **kwargs) -> List[float]:
+    """
+    Risk-aware reward:
+    - penalize hallucinations on empty-GT samples
+    - penalize omissions on positive samples
+    """
+    rewards: List[float] = []
+
+    for completion, gt_response in zip(completions, assistant):
+        if not _is_format_valid(completion, gt_response):
+            rewards.append(0.0)
+            continue
+
+        pred_dets = _extract_detections(completion)
+        gt_dets = _extract_detections(gt_response)
+        pred_count = len(pred_dets)
+        gt_count = len(gt_dets)
+        no_detection = _is_no_detection_response(completion)
+
+        if gt_count == 0:
+            if pred_count == 0 and no_detection:
+                rewards.append(1.0)
+            elif pred_count == 0:
+                rewards.append(max(0.0, 1.0 - RISK_REWARD_CFG.no_detection_missing_penalty))
+            else:
+                halluc_penalty = min(1.0, pred_count * RISK_REWARD_CFG.hallucination_unit_penalty)
+                rewards.append(-halluc_penalty)
+            continue
+
+        if pred_count == 0:
+            rewards.append(-min(1.0, RISK_REWARD_CFG.omission_penalty))
+            continue
+
+        matches = _match_detections(
+            pred_dets,
+            gt_dets,
+            iou_threshold=RISK_REWARD_CFG.match_iou_threshold,
+            require_category=False,
+        )
+        covered_gt = {m["gt_idx"] for m in matches}
+        covered_pred = {m["pred_idx"] for m in matches}
+
+        omission_rate = 1.0 - (len(covered_gt) / max(gt_count, 1))
+        hallucinated = max(pred_count - len(covered_pred), 0)
+        reward = (
+            1.0
+            - RISK_REWARD_CFG.omission_penalty * omission_rate
+            - min(1.0, hallucinated * RISK_REWARD_CFG.hallucination_unit_penalty)
+        )
+        if no_detection:
+            reward -= RISK_REWARD_CFG.omission_penalty
+
+        rewards.append(max(-1.0, min(1.0, reward)))
+
+    return rewards
+
+
+def anomaly_instance_f1_reward(
+    completions: List[str], assistant: List[str], **kwargs
+) -> List[float]:
+    """
+    Instance-level anomaly reward on matched detections.
+    Emphasizes anomaly recall under one-to-one localization/category matches.
+    """
+    rewards: List[float] = []
+
+    for completion, gt_response in zip(completions, assistant):
+        if not _is_format_valid(completion, gt_response):
+            rewards.append(0.0)
+            continue
+
+        pred_dets = _extract_detections(completion)
+        gt_dets = _extract_detections(gt_response)
+        no_detection = _is_no_detection_response(completion)
+
+        if not gt_dets:
+            if not pred_dets and no_detection:
+                rewards.append(1.0)
+            elif not pred_dets:
+                rewards.append(max(0.0, 1.0 - RISK_REWARD_CFG.no_detection_missing_penalty))
+            else:
+                false_alarm = sum(1 for det in pred_dets if det.is_anomaly)
+                rewards.append(-min(1.0, 0.5 * false_alarm))
+            continue
+
+        matches = _match_detections(
+            pred_dets,
+            gt_dets,
+            iou_threshold=RISK_REWARD_CFG.match_iou_threshold,
+            require_category=True,
+        )
+        if not matches:
+            gt_has_anomaly = any(det.is_anomaly for det in gt_dets)
+            rewards.append(-1.0 if gt_has_anomaly else 0.0)
+            continue
+
+        matched_pred_indices = {m["pred_idx"] for m in matches}
+        gt_anomaly_total = sum(1 for det in gt_dets if det.is_anomaly)
+        pred_anomaly_total = 0
+        tp_anomaly = 0
+
+        for m in matches:
+            pred_anomaly = pred_dets[m["pred_idx"]].is_anomaly
+            gt_anomaly = gt_dets[m["gt_idx"]].is_anomaly
+            if pred_anomaly:
+                pred_anomaly_total += 1
+            if pred_anomaly and gt_anomaly:
+                tp_anomaly += 1
+
+        unmatched_pred_anomaly = sum(
+            1
+            for idx, det in enumerate(pred_dets)
+            if idx not in matched_pred_indices and det.is_anomaly
+        )
+        fp_anomaly = max(pred_anomaly_total - tp_anomaly, 0) + unmatched_pred_anomaly
+        fn_anomaly = max(gt_anomaly_total - tp_anomaly, 0)
+
+        if gt_anomaly_total == 0:
+            rewards.append(1.0 if fp_anomaly == 0 else max(-1.0, 1.0 - 0.5 * fp_anomaly))
+            continue
+
+        if no_detection and len(pred_dets) == 0:
+            rewards.append(-1.0)
+            continue
+
+        precision = tp_anomaly / (tp_anomaly + fp_anomaly) if (tp_anomaly + fp_anomaly) > 0 else 0.0
+        recall = tp_anomaly / (tp_anomaly + fn_anomaly) if (tp_anomaly + fn_anomaly) > 0 else 0.0
+        # Slightly favor recall to reduce anomaly misses.
+        reward = 0.4 * precision + 0.6 * recall
+        rewards.append(max(-1.0, min(1.0, reward)))
+
+    return rewards
+
+
 # ============ Helper Functions ============
 
 def _extract_boxes(text: str) -> List[List[int]]:
@@ -311,6 +583,130 @@ def _compute_iou(box1: List[int], box2: List[int]) -> float:
     union = area1 + area2 - intersection
 
     return intersection / union if union > 0 else 0.0
+
+
+def _normalize_category(category: str) -> str:
+    """Normalize category text for fuzzy matching."""
+    return re.sub(r"\s+", "", category.strip().lower())
+
+
+def _is_anomaly_status(status: str) -> bool:
+    """Detect anomaly status by keywords."""
+    return any(kw in status for kw in ANOMALY_KEYWORDS)
+
+
+def _category_match(pred_category: str, gt_category: str) -> bool:
+    """Fuzzy category match."""
+    pred = _normalize_category(pred_category)
+    gt = _normalize_category(gt_category)
+    if not pred or not gt:
+        return False
+    if pred == "unknown" or gt == "unknown":
+        return False
+    return pred == gt or pred in gt or gt in pred
+
+
+def _extract_detections(text: str) -> List[ParsedDetection]:
+    """Parse structured detections with category/status/bbox."""
+    detections: List[ParsedDetection] = []
+    items = re.split(r"(?=\d+\.\s+)", text)
+
+    for item in items:
+        if not item.strip():
+            continue
+
+        cat_match = re.match(r"(\d+)\.\s*([^\n]+)", item)
+        if not cat_match:
+            continue
+
+        category = cat_match.group(2).strip()
+        status_match = re.search(r"状态[：:]\s*([^\n]+)", item)
+        status = status_match.group(1).strip() if status_match else "正常"
+
+        box_match = re.search(BOX_PATTERN, item)
+        if not box_match:
+            continue
+
+        try:
+            bbox = [int(float(box_match.group(i))) for i in range(1, 5)]
+        except (ValueError, TypeError):
+            continue
+
+        detections.append(
+            ParsedDetection(
+                category=category,
+                status=status,
+                is_anomaly=_is_anomaly_status(status),
+                bbox=bbox,
+            )
+        )
+
+    # Fallback: box-only parsing
+    if not detections:
+        for box in _extract_boxes(text):
+            detections.append(
+                ParsedDetection(
+                    category="unknown",
+                    status="unknown",
+                    is_anomaly=False,
+                    bbox=box,
+                )
+            )
+
+    return detections
+
+
+def _match_detections(
+    pred_dets: List[ParsedDetection],
+    gt_dets: List[ParsedDetection],
+    iou_threshold: float,
+    require_category: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Greedy one-to-one matching by IoU.
+    Returns matched pairs with pred_idx/gt_idx/iou/category_ok.
+    """
+    candidates: List[Tuple[float, int, int, bool]] = []
+    for pred_idx, pred_det in enumerate(pred_dets):
+        for gt_idx, gt_det in enumerate(gt_dets):
+            iou = _compute_iou(pred_det.bbox, gt_det.bbox)
+            if iou < iou_threshold:
+                continue
+            category_ok = _category_match(pred_det.category, gt_det.category)
+            if require_category and not category_ok:
+                continue
+            # Prefer higher IoU, then category-consistent matches.
+            score = iou + (0.01 if category_ok else 0.0)
+            candidates.append((score, pred_idx, gt_idx, category_ok))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    used_pred = set()
+    used_gt = set()
+    matches: List[Dict[str, Any]] = []
+
+    for _, pred_idx, gt_idx, category_ok in candidates:
+        if pred_idx in used_pred or gt_idx in used_gt:
+            continue
+        used_pred.add(pred_idx)
+        used_gt.add(gt_idx)
+        iou = _compute_iou(pred_dets[pred_idx].bbox, gt_dets[gt_idx].bbox)
+        matches.append(
+            {
+                "pred_idx": pred_idx,
+                "gt_idx": gt_idx,
+                "iou": iou,
+                "category_ok": category_ok,
+            }
+        )
+
+    return matches
+
+
+def _safe_f1(precision: float, recall: float) -> float:
+    """F1 helper."""
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
 
 
 # ============ Data Processing ============
@@ -577,6 +973,43 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--beta", type=float, default=0.1,
                         help="KL penalty coefficient")
+    parser.add_argument(
+        "--reward_scheme",
+        type=str,
+        default="risk_aware",
+        choices=["risk_aware", "legacy"],
+        help="Reward design: risk_aware (recommended) or legacy",
+    )
+    parser.add_argument(
+        "--reward_match_iou",
+        type=float,
+        default=0.5,
+        help="IoU threshold for one-to-one matching in risk-aware rewards",
+    )
+    parser.add_argument(
+        "--reward_hallucination_unit_penalty",
+        type=float,
+        default=0.35,
+        help="Per-instance hallucination penalty (risk-aware rewards)",
+    )
+    parser.add_argument(
+        "--reward_no_detection_missing_penalty",
+        type=float,
+        default=0.2,
+        help="Penalty when GT is empty but model does not output explicit no-detection text",
+    )
+    parser.add_argument(
+        "--reward_omission_penalty",
+        type=float,
+        default=1.0,
+        help="Penalty strength for missing detections on positive samples",
+    )
+    parser.add_argument("--reward_w_format", type=float, default=0.2)
+    parser.add_argument("--reward_w_set_f1", type=float, default=3.0)
+    parser.add_argument("--reward_w_iou", type=float, default=2.0)
+    parser.add_argument("--reward_w_count", type=float, default=1.2)
+    parser.add_argument("--reward_w_risk", type=float, default=2.5)
+    parser.add_argument("--reward_w_anomaly", type=float, default=2.0)
 
     # Training arguments
     parser.add_argument("--output_dir", type=str, default="outputs/qwen3vl_grpo_trl")
@@ -611,6 +1044,15 @@ def main():
 
     # Set seed
     torch.manual_seed(args.seed)
+
+    # Configure risk-aware reward parameters (used when reward_scheme=risk_aware)
+    global RISK_REWARD_CFG
+    RISK_REWARD_CFG = RiskRewardConfig(
+        match_iou_threshold=max(0.1, min(0.95, float(args.reward_match_iou))),
+        hallucination_unit_penalty=max(0.0, float(args.reward_hallucination_unit_penalty)),
+        no_detection_missing_penalty=max(0.0, float(args.reward_no_detection_missing_penalty)),
+        omission_penalty=max(0.0, float(args.reward_omission_penalty)),
+    )
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -650,20 +1092,42 @@ def main():
         logger.info("No validation data provided, skipping validation")
 
     # Define reward functions
-    reward_funcs = [
-        format_reward,
-        bbox_iou_reward,
-        category_match_reward,
-        status_accuracy_reward,
-    ]
-
-    # Reward weights with gating design:
-    # - format_reward: low weight (0.2) but acts as gate (0 or 1)
-    # - bbox_iou_reward: high weight (3.0) for accurate localization
-    # - category_match_reward: medium weight (2.0) for correct classification
-    # - status_accuracy_reward: medium weight (2.0) for anomaly detection
-    # Total max reward: 0.2 + 3.0 + 2.0 + 2.0 = 7.2
-    reward_weights = [0.2, 3.0, 2.0, 2.0]
+    if args.reward_scheme == "legacy":
+        reward_funcs = [
+            format_reward,
+            bbox_iou_reward,
+            category_match_reward,
+            status_accuracy_reward,
+        ]
+        reward_weights = [0.2, 3.0, 2.0, 2.0]
+        logger.info("Using LEGACY reward scheme")
+    else:
+        reward_funcs = [
+            format_reward,
+            set_f1_reward,
+            localization_quality_reward,
+            count_alignment_reward,
+            risk_control_reward,
+            anomaly_instance_f1_reward,
+        ]
+        reward_weights = [
+            args.reward_w_format,
+            args.reward_w_set_f1,
+            args.reward_w_iou,
+            args.reward_w_count,
+            args.reward_w_risk,
+            args.reward_w_anomaly,
+        ]
+        logger.info("Using RISK-AWARE reward scheme")
+        logger.info(
+            "Risk-aware reward cfg: match_iou=%.2f, halluc_penalty=%.2f, "
+            "no_det_missing_penalty=%.2f, omission_penalty=%.2f",
+            RISK_REWARD_CFG.match_iou_threshold,
+            RISK_REWARD_CFG.hallucination_unit_penalty,
+            RISK_REWARD_CFG.no_detection_missing_penalty,
+            RISK_REWARD_CFG.omission_penalty,
+        )
+        logger.info("Risk-aware reward weights: %s", reward_weights)
 
     # Setup logging
     if args.use_wandb:

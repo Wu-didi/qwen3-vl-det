@@ -25,6 +25,20 @@ BETA=0.5                          # KL 惩罚系数 (防止模型偏离太远)
                                   # 0.5: 中度约束，推荐起始值
                                   # 1.0: 强约束，保守更新
 
+# 奖励函数方案: risk_aware(推荐, 可写论文) | legacy(旧版)
+REWARD_SCHEME="${REWARD_SCHEME:-risk_aware}"
+REWARD_MATCH_IOU="${REWARD_MATCH_IOU:-0.5}"
+REWARD_HALLUCINATION_UNIT_PENALTY="${REWARD_HALLUCINATION_UNIT_PENALTY:-0.35}"
+REWARD_NO_DET_MISSING_PENALTY="${REWARD_NO_DET_MISSING_PENALTY:-0.2}"
+REWARD_OMISSION_PENALTY="${REWARD_OMISSION_PENALTY:-1.0}"
+# 风险感知奖励权重 (仅 REWARD_SCHEME=risk_aware 生效)
+REWARD_W_FORMAT="${REWARD_W_FORMAT:-0.2}"
+REWARD_W_SET_F1="${REWARD_W_SET_F1:-3.0}"
+REWARD_W_IOU="${REWARD_W_IOU:-2.0}"
+REWARD_W_COUNT="${REWARD_W_COUNT:-1.2}"
+REWARD_W_RISK="${REWARD_W_RISK:-2.5}"
+REWARD_W_ANOMALY="${REWARD_W_ANOMALY:-2.0}"
+
 #==========================================
 # 路径配置
 #==========================================
@@ -82,6 +96,7 @@ echo "Num Generations: $NUM_GENERATIONS"
 echo "Learning Rate: $LEARNING_RATE"
 echo "Beta (KL coef): $BETA"
 echo "LoRA R: $LORA_R"
+echo "Reward scheme: $REWARD_SCHEME"
 echo "=========================================="
 
 CMD="python scripts/training/grpo_finetune_trl.py \
@@ -96,6 +111,17 @@ CMD="python scripts/training/grpo_finetune_trl.py \
     --lora_dropout $LORA_DROPOUT \
     --temperature $TEMPERATURE \
     --beta $BETA \
+    --reward_scheme $REWARD_SCHEME \
+    --reward_match_iou $REWARD_MATCH_IOU \
+    --reward_hallucination_unit_penalty $REWARD_HALLUCINATION_UNIT_PENALTY \
+    --reward_no_detection_missing_penalty $REWARD_NO_DET_MISSING_PENALTY \
+    --reward_omission_penalty $REWARD_OMISSION_PENALTY \
+    --reward_w_format $REWARD_W_FORMAT \
+    --reward_w_set_f1 $REWARD_W_SET_F1 \
+    --reward_w_iou $REWARD_W_IOU \
+    --reward_w_count $REWARD_W_COUNT \
+    --reward_w_risk $REWARD_W_RISK \
+    --reward_w_anomaly $REWARD_W_ANOMALY \
     --num_epochs $NUM_EPOCHS \
     --gradient_accumulation_steps $GRADIENT_ACCUMULATION \
     --learning_rate $LEARNING_RATE \
