@@ -43,6 +43,55 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+NO_DETECTION_PATTERNS = [
+    "未检测到相关设备",
+    "未检测到设备",
+    "未检测到目标",
+    "没有检测到",
+    "no relevant equipment",
+    "no equipment detected",
+]
+
+BOX_PATTERN = (
+    r"<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*"
+    r"\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>"
+)
+
+
+def _is_no_detection_response(text: str) -> bool:
+    """Check whether the model explicitly says no equipment was detected."""
+    text_lower = text.lower()
+    return any(pattern in text_lower for pattern in NO_DETECTION_PATTERNS)
+
+
+def _has_structured_detection_format(text: str) -> bool:
+    """Check whether completion follows numbered + status + box format."""
+    has_box = bool(re.search(BOX_PATTERN, text))
+    has_numbered = bool(re.search(r"\d+\.\s+\S+", text))
+    has_status = bool(re.search(r"状态[：:]\s*\S+", text))
+    return has_box and has_numbered and has_status
+
+
+def _is_format_valid(completion: str, gt_response: Optional[str] = None) -> bool:
+    """
+    Strict format gate used by all reward functions.
+
+    Valid cases:
+    1. Standard structured detections (numbered + status + box).
+    2. For no-box ground truth samples, explicit "no detection" response.
+    """
+    if _has_structured_detection_format(completion):
+        return True
+
+    if gt_response is None:
+        return False
+
+    gt_boxes = _extract_boxes(gt_response)
+    if not gt_boxes and _is_no_detection_response(completion):
+        return True
+
+    return False
+
 
 def get_model_class(model_path: str):
     """Get the appropriate model class based on model path."""
@@ -64,7 +113,11 @@ def get_model_class(model_path: str):
 
 # ============ Reward Functions ============
 
-def format_reward(completions: List[str], **kwargs) -> List[float]:
+def format_reward(
+    completions: List[str],
+    assistant: Optional[List[str]] = None,
+    **kwargs,
+) -> List[float]:
     """
     Reward function that checks if the completion has proper format.
     Acts as a gating function: returns 0 if format is invalid, 1 if valid.
@@ -76,27 +129,9 @@ def format_reward(completions: List[str], **kwargs) -> List[float]:
     """
     rewards = []
 
-    for completion in completions:
-        # Check for box format (updated to support floats and negative numbers)
-        has_box = bool(re.search(
-            r'<box>\s*\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\)\s*,\s*\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\)\s*</box>',
-            completion
-        ))
-
-        # Check for numbered list format
-        has_numbered = bool(re.search(r'\d+\.\s+\S+', completion))
-
-        # Check for status
-        has_status = bool(re.search(r'状态[：:]\s*\S+', completion))
-
-        # Gating: only reward if format is correct
-        # Perfect format required: all three components present
-        if has_box and has_numbered and has_status:
-            reward = 1.0  # Valid format - allows other rewards to count
-        else:
-            reward = 0.0  # Invalid format - gates other rewards
-
-        rewards.append(reward)
+    for idx, completion in enumerate(completions):
+        gt_response = assistant[idx] if assistant and idx < len(assistant) else None
+        rewards.append(1.0 if _is_format_valid(completion, gt_response) else 0.0)
 
     return rewards
 
@@ -112,12 +147,20 @@ def bbox_iou_reward(completions: List[str], assistant: List[str], **kwargs) -> L
     rewards = []
 
     for completion, gt_response in zip(completions, assistant):
+        # Strict gate: invalid format gets zero reward for all branches.
+        if not _is_format_valid(completion, gt_response):
+            rewards.append(0.0)
+            continue
+
         pred_boxes = _extract_boxes(completion)
         gt_boxes = _extract_boxes(gt_response)
 
         if not gt_boxes:
-            # No ground truth boxes - reward if also no predictions
-            reward = 1.0 if not pred_boxes else 0.3
+            # No GT boxes: only explicit no-detection output gets full credit.
+            if not pred_boxes and _is_no_detection_response(completion):
+                reward = 1.0
+            else:
+                reward = 0.0
         elif not pred_boxes:
             # Has ground truth but no predictions - penalty
             reward = 0.0
@@ -146,11 +189,15 @@ def category_match_reward(completions: List[str], assistant: List[str], **kwargs
     rewards = []
 
     for completion, gt_response in zip(completions, assistant):
+        if not _is_format_valid(completion, gt_response):
+            rewards.append(0.0)
+            continue
+
         pred_cats = _extract_categories(completion)
         gt_cats = _extract_categories(gt_response)
 
         if not gt_cats:
-            reward = 1.0 if not pred_cats else 0.5
+            reward = 1.0 if (not pred_cats and _is_no_detection_response(completion)) else 0.0
         elif not pred_cats:
             reward = 0.0
         else:
@@ -177,11 +224,15 @@ def status_accuracy_reward(completions: List[str], assistant: List[str], **kwarg
     anomaly_keywords = ["异常", "全灭", "损坏", "故障", "破损", "不亮", "错误", "黑屏", "全亮"]
 
     for completion, gt_response in zip(completions, assistant):
+        if not _is_format_valid(completion, gt_response):
+            rewards.append(0.0)
+            continue
+
         pred_statuses = _extract_statuses(completion)
         gt_statuses = _extract_statuses(gt_response)
 
         if not gt_statuses:
-            reward = 1.0 if not pred_statuses else 0.5
+            reward = 1.0 if (not pred_statuses and _is_no_detection_response(completion)) else 0.0
         elif not pred_statuses:
             reward = 0.0
         else:
@@ -208,9 +259,7 @@ def status_accuracy_reward(completions: List[str], assistant: List[str], **kwarg
 def _extract_boxes(text: str) -> List[List[int]]:
     """Extract bounding boxes from text. Supports integers, floats, and negative numbers."""
     boxes = []
-    # Updated pattern: supports floats, negative numbers, and flexible whitespace
-    pattern = r'<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>'
-    for match in re.finditer(pattern, text):
+    for match in re.finditer(BOX_PATTERN, text):
         try:
             # Convert to int (round floats)
             box = [int(float(match.group(i))) for i in range(1, 5)]

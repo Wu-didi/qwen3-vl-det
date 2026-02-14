@@ -3,12 +3,13 @@
 目标检测评估脚本 - 计算标准检测指标
 
 支持的指标:
-- Precision (精确率)
-- Recall (召回率)
-- F1-Score
-- mAP (mean Average Precision)
+- AP50 (IoU=0.50)
+- AP75 (IoU=0.75)
+- mAP50-95 (COCO 风格，IoU=0.50:0.05:0.95)
+- Precision / Recall / F1-Score
 - AP per class
 - IoU 分布统计
+- VLM 质量指标（EM/Token-F1/ROUGE/BLEU/异常检测与计数误差等）
 
 Usage:
     # 评估微调后的模型
@@ -23,21 +24,23 @@ Usage:
         --test_data data/qwen_data/test.json \
         --iou_threshold 0.5
 
-    # 计算多个 IoU 阈值的 mAP
+    # 计算 COCO 风格 mAP
     python scripts/evaluate.py \
         --model_path outputs/qwen3vl_lora \
         --test_data data/qwen_data/test.json \
-        --iou_thresholds 0.5 0.75 0.9
+        --coco_map
 """
 
 import os
 import re
 import json
+import time
+import math
 import argparse
 import logging
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 import torch
@@ -51,6 +54,20 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+COCO_IOU_THRESHOLDS = [round(0.5 + i * 0.05, 2) for i in range(10)]
+NO_OBJECT_PATTERNS = [
+    "未检测到相关设备",
+    "未检测到设备",
+    "未检测到目标",
+    "没有检测到",
+    "no relevant equipment",
+    "no equipment detected",
+]
+BOX_PATTERN = (
+    r"<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*"
+    r"\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>"
+)
 
 
 def get_model_class(model_path: str):
@@ -86,6 +103,39 @@ class EvalMetrics:
     fn: int = 0  # False Negatives
     iou_mean: float = 0.0
     iou_std: float = 0.0
+    num_pred: int = 0
+    num_gt: int = 0
+
+
+@dataclass
+class VLMEvalMetrics:
+    """VLM 常规质量指标（与检测 AP 互补）"""
+    parse_success_rate: float = 0.0
+    strict_format_rate: float = 0.0
+    no_object_rejection_rate: float = 0.0
+    hallucination_rate: float = 0.0
+    false_rejection_rate: float = 0.0
+    omission_rate: float = 0.0
+    anomaly_accuracy: float = 0.0
+    anomaly_precision: float = 0.0
+    anomaly_recall: float = 0.0
+    anomaly_f1: float = 0.0
+    category_precision: float = 0.0
+    category_recall: float = 0.0
+    category_f1: float = 0.0
+    exact_match_rate: float = 0.0
+    token_f1: float = 0.0
+    rouge_l_f1: float = 0.0
+    bleu1: float = 0.0
+    bleu4: float = 0.0
+    count_mae: float = 0.0
+    count_rmse: float = 0.0
+    avg_response_tokens: float = 0.0
+    avg_pred_boxes: float = 0.0
+    avg_gt_boxes: float = 0.0
+    latency_ms_mean: float = 0.0
+    latency_ms_p50: float = 0.0
+    latency_ms_p95: float = 0.0
 
 
 class DetectionParser:
@@ -118,9 +168,29 @@ class DetectionParser:
             status_match = re.search(r'状态[：:]\s*([^\n]+)', item)
             status = status_match.group(1).strip() if status_match else "正常"
 
+            # 提取置信度（可选）
+            confidence = 1.0
+            conf_match = re.search(
+                r'(?:confidence|置信度)\s*[：:]\s*([01](?:\.\d+)?|\d{1,3}(?:\.\d+)?%)',
+                item,
+                flags=re.IGNORECASE,
+            )
+            if conf_match:
+                conf_text = conf_match.group(1).strip()
+                try:
+                    if conf_text.endswith("%"):
+                        confidence = float(conf_text[:-1]) / 100.0
+                    else:
+                        confidence = float(conf_text)
+                        if confidence > 1.0:
+                            confidence = confidence / 100.0
+                    confidence = float(np.clip(confidence, 0.0, 1.0))
+                except ValueError:
+                    confidence = 1.0
+
             # 提取坐标 (支持浮点数和负数)
             box_match = re.search(
-                r'<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>',
+                BOX_PATTERN,
                 item
             )
             if not box_match:
@@ -140,14 +210,14 @@ class DetectionParser:
             detections.append(Detection(
                 category=category,
                 bbox=[x1, y1, x2, y2],
+                confidence=confidence,
                 status=status,
                 is_anomaly=is_anomaly,
             ))
 
         # 如果上面没匹配到，尝试只提取 box 坐标 (支持浮点数和负数)
         if not detections:
-            box_pattern = r'<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>'
-            simple_matches = re.findall(box_pattern, text)
+            simple_matches = re.findall(BOX_PATTERN, text)
             for match in simple_matches:
                 try:
                     x1 = int(float(match[0]))
@@ -165,8 +235,318 @@ class DetectionParser:
         return detections
 
 
+def normalize_text(text: str) -> str:
+    """Normalize text for VLM quality metrics."""
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def tokenize_text_for_metrics(text: str) -> List[str]:
+    """
+    Tokenize text for BLEU/ROUGE:
+    - Use whitespace tokens when spaces exist.
+    - Fallback to char-level tokens for Chinese-like text.
+    """
+    normalized = normalize_text(text)
+    if not normalized:
+        return []
+    if " " in normalized:
+        return [tok for tok in normalized.split(" ") if tok]
+    return [ch for ch in normalized if not ch.isspace()]
+
+
+def extract_ngram_counts(tokens: List[str], n: int) -> Dict[Tuple[str, ...], int]:
+    """Extract n-gram counts."""
+    counts: Dict[Tuple[str, ...], int] = defaultdict(int)
+    if n <= 0 or len(tokens) < n:
+        return counts
+    for i in range(len(tokens) - n + 1):
+        counts[tuple(tokens[i : i + n])] += 1
+    return counts
+
+
+def compute_corpus_bleu(
+    pred_token_lists: List[List[str]],
+    ref_token_lists: List[List[str]],
+    max_n: int = 4,
+) -> float:
+    """Compute smoothed corpus BLEU score."""
+    if not pred_token_lists or not ref_token_lists:
+        return 0.0
+
+    total_pred_len = sum(len(tokens) for tokens in pred_token_lists)
+    total_ref_len = sum(len(tokens) for tokens in ref_token_lists)
+    if total_pred_len == 0:
+        return 0.0
+
+    if total_pred_len > total_ref_len:
+        bp = 1.0
+    else:
+        bp = math.exp(1.0 - (total_ref_len / max(total_pred_len, 1)))
+
+    log_p_sum = 0.0
+    for n in range(1, max_n + 1):
+        clipped_total = 0
+        pred_total = 0
+
+        for pred_tokens, ref_tokens in zip(pred_token_lists, ref_token_lists):
+            pred_counts = extract_ngram_counts(pred_tokens, n)
+            ref_counts = extract_ngram_counts(ref_tokens, n)
+
+            pred_total += sum(pred_counts.values())
+            for gram, cnt in pred_counts.items():
+                clipped_total += min(cnt, ref_counts.get(gram, 0))
+
+        # Add-1 smoothing
+        p_n = (clipped_total + 1.0) / (pred_total + 1.0)
+        log_p_sum += math.log(p_n)
+
+    return float(bp * math.exp(log_p_sum / max_n))
+
+
+def lcs_length(a: List[str], b: List[str]) -> int:
+    """Compute LCS length with O(min(m,n)) memory."""
+    if len(a) < len(b):
+        a, b = b, a
+
+    dp = [0] * (len(b) + 1)
+    for i in range(1, len(a) + 1):
+        prev = 0
+        for j in range(1, len(b) + 1):
+            tmp = dp[j]
+            if a[i - 1] == b[j - 1]:
+                dp[j] = prev + 1
+            else:
+                dp[j] = max(dp[j], dp[j - 1])
+            prev = tmp
+    return dp[-1]
+
+
+def compute_rouge_l_f1(pred_tokens: List[str], ref_tokens: List[str]) -> float:
+    """Compute ROUGE-L F1 for a single sample."""
+    if not pred_tokens and not ref_tokens:
+        return 1.0
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+
+    lcs = lcs_length(pred_tokens, ref_tokens)
+    precision = lcs / len(pred_tokens)
+    recall = lcs / len(ref_tokens)
+    if precision + recall == 0:
+        return 0.0
+    return float(2 * precision * recall / (precision + recall))
+
+
+def compute_token_f1(pred_tokens: List[str], ref_tokens: List[str]) -> float:
+    """Compute token-level F1 (SQuAD-style overlap)."""
+    if not pred_tokens and not ref_tokens:
+        return 1.0
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+
+    pred_counts = Counter(pred_tokens)
+    ref_counts = Counter(ref_tokens)
+    overlap = sum(min(cnt, ref_counts.get(tok, 0)) for tok, cnt in pred_counts.items())
+    if overlap <= 0:
+        return 0.0
+
+    precision = overlap / len(pred_tokens)
+    recall = overlap / len(ref_tokens)
+    if precision + recall == 0:
+        return 0.0
+    return float(2 * precision * recall / (precision + recall))
+
+
+def is_no_object_response(text: str) -> bool:
+    """Check whether text explicitly indicates no object/equipment."""
+    text_lower = text.lower()
+    return any(pattern in text_lower for pattern in NO_OBJECT_PATTERNS)
+
+
+def is_strict_detection_format(text: str) -> bool:
+    """Check strict structured detection format."""
+    has_box = bool(re.search(BOX_PATTERN, text))
+    has_numbered = bool(re.search(r"\d+\.\s+\S+", text))
+    has_status = bool(re.search(r"状态[：:]\s*\S+", text))
+    return has_box and has_numbered and has_status
+
+
+def compute_vlm_metrics(samples_for_eval: List[Dict]) -> VLMEvalMetrics:
+    """Compute VLM-oriented quality metrics for paper reporting."""
+    total = len(samples_for_eval)
+    if total == 0:
+        return VLMEvalMetrics()
+
+    parse_success = 0
+    strict_format = 0
+    no_object_total = 0
+    no_object_rejected = 0
+    hallucinations = 0
+    non_empty_total = 0
+    false_rejections = 0
+    omissions = 0
+    anomaly_correct = 0
+    anomaly_tp = 0
+    anomaly_fp = 0
+    anomaly_fn = 0
+
+    category_tp = 0
+    category_fp = 0
+    category_fn = 0
+
+    exact_match = 0
+    token_f1_scores: List[float] = []
+    rouge_scores: List[float] = []
+    pred_token_lists: List[List[str]] = []
+    ref_token_lists: List[List[str]] = []
+    response_tokens_total = 0
+
+    pred_boxes_total = 0
+    gt_boxes_total = 0
+    count_abs_errors: List[float] = []
+    count_sq_errors: List[float] = []
+
+    latency_ms: List[float] = []
+
+    for sample in samples_for_eval:
+        pred_text = sample.get("pred_text", "")
+        gt_text = sample.get("gt_text", "")
+        pred_dets: List[Detection] = sample.get("pred_dets", [])
+        gt_dets: List[Detection] = sample.get("gt_dets", [])
+
+        gt_empty = len(gt_dets) == 0
+        no_object_pred = is_no_object_response(pred_text)
+        strict = is_strict_detection_format(pred_text)
+
+        if strict:
+            strict_format += 1
+
+        # Parse success: parsed detections or explicit no-object declaration for empty GT.
+        parsed_ok = (len(pred_dets) > 0) or (gt_empty and no_object_pred)
+        if parsed_ok:
+            parse_success += 1
+
+        if gt_empty:
+            no_object_total += 1
+            if no_object_pred and len(pred_dets) == 0:
+                no_object_rejected += 1
+            if len(pred_dets) > 0:
+                hallucinations += 1
+        else:
+            non_empty_total += 1
+            if no_object_pred:
+                false_rejections += 1
+            if len(pred_dets) == 0:
+                omissions += 1
+
+        gt_has_anomaly = any(det.is_anomaly for det in gt_dets)
+        pred_has_anomaly = any(det.is_anomaly for det in pred_dets)
+        if gt_has_anomaly == pred_has_anomaly:
+            anomaly_correct += 1
+        if pred_has_anomaly and gt_has_anomaly:
+            anomaly_tp += 1
+        elif pred_has_anomaly and not gt_has_anomaly:
+            anomaly_fp += 1
+        elif (not pred_has_anomaly) and gt_has_anomaly:
+            anomaly_fn += 1
+
+        gt_cats = {DetectionEvaluator._normalize_category(det.category) for det in gt_dets}
+        pred_cats = {DetectionEvaluator._normalize_category(det.category) for det in pred_dets}
+        category_tp += len(gt_cats & pred_cats)
+        category_fp += len(pred_cats - gt_cats)
+        category_fn += len(gt_cats - pred_cats)
+
+        pred_tokens = tokenize_text_for_metrics(pred_text)
+        ref_tokens = tokenize_text_for_metrics(gt_text)
+        if normalize_text(pred_text) == normalize_text(gt_text):
+            exact_match += 1
+        token_f1_scores.append(compute_token_f1(pred_tokens, ref_tokens))
+        pred_token_lists.append(pred_tokens)
+        ref_token_lists.append(ref_tokens)
+        rouge_scores.append(compute_rouge_l_f1(pred_tokens, ref_tokens))
+        response_tokens_total += len(pred_tokens)
+
+        pred_boxes_total += len(pred_dets)
+        gt_boxes_total += len(gt_dets)
+        count_error = float(len(pred_dets) - len(gt_dets))
+        count_abs_errors.append(abs(count_error))
+        count_sq_errors.append(count_error * count_error)
+
+        if "latency_ms" in sample:
+            latency_ms.append(float(sample["latency_ms"]))
+
+    category_precision = (
+        category_tp / (category_tp + category_fp) if (category_tp + category_fp) > 0 else 0.0
+    )
+    category_recall = (
+        category_tp / (category_tp + category_fn) if (category_tp + category_fn) > 0 else 0.0
+    )
+    category_f1 = (
+        2 * category_precision * category_recall / (category_precision + category_recall)
+        if (category_precision + category_recall) > 0
+        else 0.0
+    )
+    anomaly_precision = (
+        anomaly_tp / (anomaly_tp + anomaly_fp) if (anomaly_tp + anomaly_fp) > 0 else 0.0
+    )
+    anomaly_recall = (
+        anomaly_tp / (anomaly_tp + anomaly_fn) if (anomaly_tp + anomaly_fn) > 0 else 0.0
+    )
+    anomaly_f1 = (
+        2 * anomaly_precision * anomaly_recall / (anomaly_precision + anomaly_recall)
+        if (anomaly_precision + anomaly_recall) > 0
+        else 0.0
+    )
+
+    if latency_ms:
+        latency_arr = np.array(latency_ms, dtype=np.float32)
+        latency_mean = float(np.mean(latency_arr))
+        latency_p50 = float(np.percentile(latency_arr, 50))
+        latency_p95 = float(np.percentile(latency_arr, 95))
+    else:
+        latency_mean = 0.0
+        latency_p50 = 0.0
+        latency_p95 = 0.0
+
+    return VLMEvalMetrics(
+        parse_success_rate=parse_success / total,
+        strict_format_rate=strict_format / total,
+        no_object_rejection_rate=(
+            no_object_rejected / no_object_total if no_object_total > 0 else 0.0
+        ),
+        hallucination_rate=(
+            hallucinations / no_object_total if no_object_total > 0 else 0.0
+        ),
+        false_rejection_rate=(
+            false_rejections / non_empty_total if non_empty_total > 0 else 0.0
+        ),
+        omission_rate=(
+            omissions / non_empty_total if non_empty_total > 0 else 0.0
+        ),
+        anomaly_accuracy=anomaly_correct / total,
+        anomaly_precision=anomaly_precision,
+        anomaly_recall=anomaly_recall,
+        anomaly_f1=anomaly_f1,
+        category_precision=category_precision,
+        category_recall=category_recall,
+        category_f1=category_f1,
+        exact_match_rate=exact_match / total,
+        token_f1=float(np.mean(token_f1_scores)) if token_f1_scores else 0.0,
+        rouge_l_f1=float(np.mean(rouge_scores)) if rouge_scores else 0.0,
+        bleu1=compute_corpus_bleu(pred_token_lists, ref_token_lists, max_n=1),
+        bleu4=compute_corpus_bleu(pred_token_lists, ref_token_lists, max_n=4),
+        count_mae=float(np.mean(count_abs_errors)) if count_abs_errors else 0.0,
+        count_rmse=float(np.sqrt(np.mean(count_sq_errors))) if count_sq_errors else 0.0,
+        avg_response_tokens=response_tokens_total / total,
+        avg_pred_boxes=pred_boxes_total / total,
+        avg_gt_boxes=gt_boxes_total / total,
+        latency_ms_mean=latency_mean,
+        latency_ms_p50=latency_p50,
+        latency_ms_p95=latency_p95,
+    )
+
+
 class DetectionEvaluator:
-    """目标检测评估器"""
+    """目标检测评估器（COCO/YOLO 风格 AP 计算）"""
 
     def __init__(self, iou_threshold: float = 0.5):
         self.iou_threshold = iou_threshold
@@ -193,180 +573,213 @@ class DetectionEvaluator:
 
         return intersection / union if union > 0 else 0.0
 
-    def match_detections(
-        self,
-        pred_dets: List[Detection],
-        gt_dets: List[Detection],
-    ) -> Tuple[List[Tuple[int, int, float]], List[int], List[int]]:
-        """
-        匹配预测和真实检测框
-
-        Returns:
-            matches: List[(pred_idx, gt_idx, iou)]
-            unmatched_preds: List[pred_idx]
-            unmatched_gts: List[gt_idx]
-        """
-        if not pred_dets or not gt_dets:
-            return [], list(range(len(pred_dets))), list(range(len(gt_dets)))
-
-        # 计算所有配对的 IoU
-        iou_matrix = np.zeros((len(pred_dets), len(gt_dets)))
-        for i, pred in enumerate(pred_dets):
-            for j, gt in enumerate(gt_dets):
-                # 只匹配相同类别
-                if self._normalize_category(pred.category) == self._normalize_category(gt.category):
-                    iou_matrix[i, j] = self.compute_iou(pred.bbox, gt.bbox)
-
-        # 贪心匹配：优先匹配 IoU 最高的
-        matches = []
-        matched_preds = set()
-        matched_gts = set()
-
-        # 按 IoU 从高到低排序
-        iou_pairs = []
-        for i in range(len(pred_dets)):
-            for j in range(len(gt_dets)):
-                if iou_matrix[i, j] >= self.iou_threshold:
-                    iou_pairs.append((i, j, iou_matrix[i, j]))
-
-        iou_pairs.sort(key=lambda x: x[2], reverse=True)
-
-        for pred_idx, gt_idx, iou in iou_pairs:
-            if pred_idx not in matched_preds and gt_idx not in matched_gts:
-                matches.append((pred_idx, gt_idx, iou))
-                matched_preds.add(pred_idx)
-                matched_gts.add(gt_idx)
-
-        unmatched_preds = [i for i in range(len(pred_dets)) if i not in matched_preds]
-        unmatched_gts = [i for i in range(len(gt_dets)) if i not in matched_gts]
-
-        return matches, unmatched_preds, unmatched_gts
-
     @staticmethod
     def _normalize_category(category: str) -> str:
         """归一化类别名称（用于匹配）"""
-        # 移除空格、标点
-        category = category.strip().lower()
-        # 可以添加更多归一化规则
-        return category
+        return category.strip().lower()
 
-    def evaluate_sample(
+    @staticmethod
+    def _compute_ap(recalls: np.ndarray, precisions: np.ndarray) -> float:
+        """
+        计算 AP（COCO/YOLO 常见 101-point interpolation）。
+        """
+        if recalls.size == 0 or precisions.size == 0:
+            return 0.0
+
+        mrec = np.concatenate(([0.0], recalls, [1.0]))
+        mpre = np.concatenate(([0.0], precisions, [0.0]))
+
+        # Precision envelope
+        for i in range(mpre.size - 1, 0, -1):
+            mpre[i - 1] = max(mpre[i - 1], mpre[i])
+
+        recall_points = np.linspace(0.0, 1.0, 101)
+        ap = 0.0
+        for r in recall_points:
+            valid = np.where(mrec >= r)[0]
+            ap += np.max(mpre[valid]) if valid.size > 0 else 0.0
+        return float(ap / len(recall_points))
+
+    def _evaluate_single_class(
         self,
-        pred_text: str,
-        gt_dets: List[Detection],
-    ) -> Dict:
-        """评估单个样本"""
-        pred_dets = self.parser.parse_box_format(pred_text)
+        preds: List[Dict],
+        gt_by_image: Dict[str, List[List[float]]],
+        iou_threshold: float,
+    ) -> Tuple[EvalMetrics, List[float], bool]:
+        """
+        评估单个类别（按 confidence 排序，计算 AP/PR/F1）。
+        """
+        num_gt = sum(len(v) for v in gt_by_image.values())
+        num_pred = len(preds)
 
-        matches, unmatched_preds, unmatched_gts = self.match_detections(
-            pred_dets, gt_dets
-        )
+        if num_pred > 0:
+            preds_sorted = sorted(preds, key=lambda x: x["confidence"], reverse=True)
+        else:
+            preds_sorted = []
 
-        tp = len(matches)
-        fp = len(unmatched_preds)
-        fn = len(unmatched_gts)
+        tp_flags = np.zeros(num_pred, dtype=np.float32)
+        fp_flags = np.zeros(num_pred, dtype=np.float32)
+        matched_ious: List[float] = []
 
-        # 计算匹配的 IoU 统计
-        ious = [iou for _, _, iou in matches]
-
-        return {
-            "tp": tp,
-            "fp": fp,
-            "fn": fn,
-            "ious": ious,
-            "num_pred": len(pred_dets),
-            "num_gt": len(gt_dets),
+        # 每个 IoU 阈值下，一张图中的每个 GT 最多匹配一次
+        matched = {
+            image_id: np.zeros(len(boxes), dtype=bool)
+            for image_id, boxes in gt_by_image.items()
         }
 
-    def compute_metrics(
-        self,
-        all_results: List[Dict],
-    ) -> EvalMetrics:
-        """计算总体指标"""
-        total_tp = sum(r["tp"] for r in all_results)
-        total_fp = sum(r["fp"] for r in all_results)
-        total_fn = sum(r["fn"] for r in all_results)
+        for i, pred in enumerate(preds_sorted):
+            image_id = pred["image_id"]
+            pred_bbox = pred["bbox"]
+            gt_boxes = gt_by_image.get(image_id, [])
 
-        # Precision & Recall
-        precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-        recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+            if not gt_boxes:
+                fp_flags[i] = 1.0
+                continue
 
-        # F1-Score
+            ious = np.array([self.compute_iou(pred_bbox, gt_bbox) for gt_bbox in gt_boxes])
+            best_idx = int(np.argmax(ious))
+            best_iou = float(ious[best_idx])
+
+            if best_iou >= iou_threshold and not matched[image_id][best_idx]:
+                tp_flags[i] = 1.0
+                matched[image_id][best_idx] = True
+                matched_ious.append(best_iou)
+            else:
+                fp_flags[i] = 1.0
+
+        tp_cum = np.cumsum(tp_flags)
+        fp_cum = np.cumsum(fp_flags)
+
+        if num_pred > 0:
+            precisions_curve = tp_cum / (tp_cum + fp_cum + 1e-9)
+        else:
+            precisions_curve = np.array([], dtype=np.float32)
+
+        if num_gt > 0:
+            recalls_curve = tp_cum / (num_gt + 1e-9)
+            ap = self._compute_ap(recalls_curve, precisions_curve)
+        else:
+            recalls_curve = np.array([], dtype=np.float32)
+            ap = 0.0
+
+        tp = int(tp_cum[-1]) if tp_cum.size > 0 else 0
+        fp = int(fp_cum[-1]) if fp_cum.size > 0 else 0
+        fn = max(num_gt - tp, 0)
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         f1_score = (
             2 * precision * recall / (precision + recall)
             if (precision + recall) > 0
             else 0.0
         )
 
-        # IoU 统计
-        all_ious = []
-        for r in all_results:
-            all_ious.extend(r["ious"])
+        iou_mean = float(np.mean(matched_ious)) if matched_ious else 0.0
+        iou_std = float(np.std(matched_ious)) if matched_ious else 0.0
 
-        iou_mean = np.mean(all_ious) if all_ious else 0.0
-        iou_std = np.std(all_ious) if all_ious else 0.0
-
-        return EvalMetrics(
+        metrics = EvalMetrics(
             precision=precision,
             recall=recall,
             f1_score=f1_score,
+            ap=ap,
+            tp=tp,
+            fp=fp,
+            fn=fn,
+            iou_mean=iou_mean,
+            iou_std=iou_std,
+            num_pred=num_pred,
+            num_gt=num_gt,
+        )
+        return metrics, matched_ious, num_gt > 0
+
+    def evaluate_dataset(
+        self,
+        samples: List[Dict],
+        iou_threshold: float,
+    ) -> Dict[str, Dict]:
+        """
+        评估整个数据集，在指定 IoU 阈值下输出 overall/per-class 指标。
+        """
+        class_preds: Dict[str, List[Dict]] = defaultdict(list)
+        class_gts: Dict[str, Dict[str, List[List[float]]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+
+        for sample in samples:
+            image_id = sample["image_id"]
+            for det in sample["pred_dets"]:
+                cat = self._normalize_category(det.category)
+                class_preds[cat].append(
+                    {
+                        "image_id": image_id,
+                        "bbox": det.bbox,
+                        "confidence": float(det.confidence),
+                    }
+                )
+            for det in sample["gt_dets"]:
+                cat = self._normalize_category(det.category)
+                class_gts[cat][image_id].append(det.bbox)
+
+        all_classes = sorted(set(class_preds.keys()) | set(class_gts.keys()))
+        per_class_metrics: Dict[str, EvalMetrics] = {}
+
+        total_tp = total_fp = total_fn = 0
+        total_num_pred = total_num_gt = 0
+        all_matched_ious: List[float] = []
+        class_aps_with_gt: List[float] = []
+
+        for cat in all_classes:
+            metrics, matched_ious, has_gt = self._evaluate_single_class(
+                class_preds.get(cat, []),
+                class_gts.get(cat, {}),
+                iou_threshold,
+            )
+            per_class_metrics[cat] = metrics
+
+            total_tp += metrics.tp
+            total_fp += metrics.fp
+            total_fn += metrics.fn
+            total_num_pred += metrics.num_pred
+            total_num_gt += metrics.num_gt
+            all_matched_ious.extend(matched_ious)
+            if has_gt:
+                class_aps_with_gt.append(metrics.ap)
+
+        overall_precision = (
+            total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+        )
+        overall_recall = (
+            total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+        )
+        overall_f1 = (
+            2 * overall_precision * overall_recall / (overall_precision + overall_recall)
+            if (overall_precision + overall_recall) > 0
+            else 0.0
+        )
+        overall_ap = float(np.mean(class_aps_with_gt)) if class_aps_with_gt else 0.0
+        overall_iou_mean = (
+            float(np.mean(all_matched_ious)) if all_matched_ious else 0.0
+        )
+        overall_iou_std = float(np.std(all_matched_ious)) if all_matched_ious else 0.0
+
+        overall_metrics = EvalMetrics(
+            precision=overall_precision,
+            recall=overall_recall,
+            f1_score=overall_f1,
+            ap=overall_ap,
             tp=total_tp,
             fp=total_fp,
             fn=total_fn,
-            iou_mean=iou_mean,
-            iou_std=iou_std,
+            iou_mean=overall_iou_mean,
+            iou_std=overall_iou_std,
+            num_pred=total_num_pred,
+            num_gt=total_num_gt,
         )
 
-    def compute_per_class_metrics(
-        self,
-        all_results: List[Dict],
-        pred_texts: List[str],
-        gt_dets_list: List[List[Detection]],
-    ) -> Dict[str, EvalMetrics]:
-        """计算每个类别的指标"""
-        # 按类别分组
-        class_results = defaultdict(list)
-
-        for pred_text, gt_dets in zip(pred_texts, gt_dets_list):
-            pred_dets = self.parser.parse_box_format(pred_text)
-
-            # 按类别分组
-            pred_by_class = defaultdict(list)
-            gt_by_class = defaultdict(list)
-
-            for det in pred_dets:
-                cat = self._normalize_category(det.category)
-                pred_by_class[cat].append(det)
-
-            for det in gt_dets:
-                cat = self._normalize_category(det.category)
-                gt_by_class[cat].append(det)
-
-            # 对每个类别单独评估
-            all_cats = set(pred_by_class.keys()) | set(gt_by_class.keys())
-            for cat in all_cats:
-                result = self.evaluate_sample(
-                    pred_text="",  # 不需要重新解析
-                    gt_dets=gt_by_class.get(cat, []),
-                )
-                # 手动设置 pred_dets
-                pred_dets_cat = pred_by_class.get(cat, [])
-                matches, unmatched_preds, unmatched_gts = self.match_detections(
-                    pred_dets_cat, gt_by_class.get(cat, [])
-                )
-                result["tp"] = len(matches)
-                result["fp"] = len(unmatched_preds)
-                result["fn"] = len(unmatched_gts)
-                result["ious"] = [iou for _, _, iou in matches]
-
-                class_results[cat].append(result)
-
-        # 计算每个类别的指标
-        class_metrics = {}
-        for cat, results in class_results.items():
-            class_metrics[cat] = self.compute_metrics(results)
-
-        return class_metrics
+        return {
+            "overall": overall_metrics,
+            "per_class": per_class_metrics,
+        }
 
 
 class ModelInference:
@@ -477,8 +890,8 @@ def load_test_data(data_path: str) -> List[Dict]:
     return data
 
 
-def parse_ground_truth(conversations: List[Dict]) -> Tuple[str, List[Detection]]:
-    """从 conversations 中解析 prompt 和 ground truth"""
+def parse_ground_truth(conversations: List[Dict]) -> Tuple[str, List[Detection], str]:
+    """从 conversations 中解析 prompt、ground truth detections 和 reference text"""
     # 提取 user 和 assistant 消息
     user_msg = ""
     assistant_msg = ""
@@ -501,7 +914,7 @@ def parse_ground_truth(conversations: List[Dict]) -> Tuple[str, List[Detection]]
     parser = DetectionParser()
     gt_dets = parser.parse_box_format(assistant_msg)
 
-    return user_msg, gt_dets
+    return user_msg, gt_dets, assistant_msg
 
 
 def run_evaluation(
@@ -531,130 +944,259 @@ def run_evaluation(
     if max_samples:
         test_data = test_data[:max_samples]
 
-    # 对每个 IoU 阈值进行评估
-    all_metrics = {}
+    # 先统一推理一次，再在不同 IoU 阈值上复用预测结果评估
+    parser = DetectionParser()
+    samples_for_eval = []
+
+    for idx, sample in enumerate(tqdm(test_data, desc="Running inference")):
+        image_path = sample["image"]
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except Exception as e:
+            logger.warning(f"Failed to load image {image_path}: {e}")
+            continue
+
+        prompt, gt_dets, gt_text = parse_ground_truth(sample["conversations"])
+
+        infer_start = time.time()
+        pred_text = inference.predict(image, prompt)
+        latency = (time.time() - infer_start) * 1000.0
+
+        pred_dets = parser.parse_box_format(pred_text)
+
+        image_id = sample.get("id") or f"{Path(image_path).stem}_{idx}"
+        samples_for_eval.append(
+            {
+                "image_id": str(image_id),
+                "pred_dets": pred_dets,
+                "gt_dets": gt_dets,
+                "pred_text": pred_text,
+                "gt_text": gt_text,
+                "latency_ms": latency,
+            }
+        )
+
+    if not samples_for_eval:
+        logger.error("No valid samples were evaluated.")
+        return
+
+    metrics_by_iou: Dict[float, Dict] = {}
 
     for iou_threshold in iou_thresholds:
         logger.info(f"\n{'='*60}")
-        logger.info(f"Evaluating with IoU threshold = {iou_threshold}")
+        logger.info(f"Evaluating with IoU threshold = {iou_threshold:.2f}")
         logger.info(f"{'='*60}")
 
         evaluator = DetectionEvaluator(iou_threshold=iou_threshold)
+        eval_result = evaluator.evaluate_dataset(samples_for_eval, iou_threshold)
+        metrics = eval_result["overall"]
+        class_metrics = eval_result["per_class"]
 
-        # 运行推理和评估
-        all_results = []
-        pred_texts = []
-        gt_dets_list = []
-
-        for sample in tqdm(test_data, desc=f"Evaluating (IoU={iou_threshold})"):
-            # 加载图片
-            image_path = sample["image"]
-            try:
-                image = Image.open(image_path).convert("RGB")
-            except Exception as e:
-                logger.warning(f"Failed to load image {image_path}: {e}")
-                continue
-
-            # 解析 ground truth
-            prompt, gt_dets = parse_ground_truth(sample["conversations"])
-
-            # 推理
-            pred_text = inference.predict(image, prompt)
-
-            # 评估
-            result = evaluator.evaluate_sample(pred_text, gt_dets)
-            all_results.append(result)
-            pred_texts.append(pred_text)
-            gt_dets_list.append(gt_dets)
-
-        # 计算总体指标
-        metrics = evaluator.compute_metrics(all_results)
-
-        logger.info(f"\nOverall Metrics (IoU={iou_threshold}):")
+        logger.info(f"\nOverall Metrics (IoU={iou_threshold:.2f}):")
+        logger.info(f"  AP:        {metrics.ap:.4f}")
         logger.info(f"  Precision: {metrics.precision:.4f}")
         logger.info(f"  Recall:    {metrics.recall:.4f}")
         logger.info(f"  F1-Score:  {metrics.f1_score:.4f}")
         logger.info(f"  TP: {metrics.tp}, FP: {metrics.fp}, FN: {metrics.fn}")
         logger.info(f"  IoU Mean:  {metrics.iou_mean:.4f} ± {metrics.iou_std:.4f}")
 
-        # 计算每个类别的指标
-        class_metrics = evaluator.compute_per_class_metrics(
-            all_results, pred_texts, gt_dets_list
-        )
-
-        logger.info(f"\nPer-Class Metrics (IoU={iou_threshold}):")
+        logger.info(f"\nPer-Class Metrics (IoU={iou_threshold:.2f}):")
         for cat, cat_metrics in sorted(class_metrics.items()):
             logger.info(f"  {cat}:")
+            logger.info(f"    AP:        {cat_metrics.ap:.4f}")
             logger.info(f"    Precision: {cat_metrics.precision:.4f}")
             logger.info(f"    Recall:    {cat_metrics.recall:.4f}")
             logger.info(f"    F1-Score:  {cat_metrics.f1_score:.4f}")
-            logger.info(f"    TP: {cat_metrics.tp}, FP: {cat_metrics.fp}, FN: {cat_metrics.fn}")
-
-        all_metrics[iou_threshold] = {
-            "overall": metrics,
-            "per_class": class_metrics,
-        }
-
-        # 保存结果
-        if output_dir:
-            result_file = os.path.join(
-                output_dir,
-                f"eval_results_iou{iou_threshold:.2f}.json"
+            logger.info(
+                f"    TP: {cat_metrics.tp}, FP: {cat_metrics.fp}, FN: {cat_metrics.fn}, "
+                f"GT: {cat_metrics.num_gt}, Pred: {cat_metrics.num_pred}"
             )
-            with open(result_file, 'w', encoding='utf-8') as f:
-                json.dump({
-                    "iou_threshold": iou_threshold,
-                    "overall": {
-                        "precision": metrics.precision,
-                        "recall": metrics.recall,
-                        "f1_score": metrics.f1_score,
-                        "tp": metrics.tp,
-                        "fp": metrics.fp,
-                        "fn": metrics.fn,
-                        "iou_mean": metrics.iou_mean,
-                        "iou_std": metrics.iou_std,
+
+        metrics_by_iou[iou_threshold] = eval_result
+
+        if output_dir:
+            result_file = os.path.join(output_dir, f"eval_results_iou{iou_threshold:.2f}.json")
+            with open(result_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "iou_threshold": iou_threshold,
+                        "overall": {
+                            "ap": metrics.ap,
+                            "precision": metrics.precision,
+                            "recall": metrics.recall,
+                            "f1_score": metrics.f1_score,
+                            "tp": metrics.tp,
+                            "fp": metrics.fp,
+                            "fn": metrics.fn,
+                            "num_gt": metrics.num_gt,
+                            "num_pred": metrics.num_pred,
+                            "iou_mean": metrics.iou_mean,
+                            "iou_std": metrics.iou_std,
+                        },
+                        "per_class": {
+                            cat: {
+                                "ap": m.ap,
+                                "precision": m.precision,
+                                "recall": m.recall,
+                                "f1_score": m.f1_score,
+                                "tp": m.tp,
+                                "fp": m.fp,
+                                "fn": m.fn,
+                                "num_gt": m.num_gt,
+                                "num_pred": m.num_pred,
+                                "iou_mean": m.iou_mean,
+                                "iou_std": m.iou_std,
+                            }
+                            for cat, m in class_metrics.items()
+                        },
                     },
-                    "per_class": {
-                        cat: {
-                            "precision": m.precision,
-                            "recall": m.recall,
-                            "f1_score": m.f1_score,
-                            "tp": m.tp,
-                            "fp": m.fp,
-                            "fn": m.fn,
-                        }
-                        for cat, m in class_metrics.items()
-                    },
-                }, f, indent=2, ensure_ascii=False)
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
             logger.info(f"Results saved to {result_file}")
 
-    # 计算 mAP (多个 IoU 阈值的平均)
-    if len(iou_thresholds) > 1:
-        map_score = np.mean([
-            all_metrics[iou]["overall"].precision
-            for iou in iou_thresholds
-        ])
-        logger.info(f"\nmAP@[{','.join(map(str, iou_thresholds))}]: {map_score:.4f}")
+    # 汇总 COCO/YOLO 风格指标
+    iou_thresholds_sorted = sorted(metrics_by_iou.keys())
 
-        if output_dir:
-            summary_file = os.path.join(output_dir, "eval_summary.json")
-            with open(summary_file, 'w', encoding='utf-8') as f:
-                json.dump({
+    def nearest_threshold(target: float) -> float:
+        return min(iou_thresholds_sorted, key=lambda x: abs(x - target))
+
+    t50 = nearest_threshold(0.5)
+    t75 = nearest_threshold(0.75)
+    ap50 = metrics_by_iou[t50]["overall"].ap
+    ap75 = metrics_by_iou[t75]["overall"].ap
+    map50_95 = float(np.mean([metrics_by_iou[t]["overall"].ap for t in iou_thresholds_sorted]))
+
+    logger.info(f"\n{'='*60}")
+    logger.info("COCO/YOLO Style Summary")
+    logger.info(f"{'='*60}")
+    logger.info(f"AP50 (IoU={t50:.2f}): {ap50:.4f}")
+    logger.info(f"AP75 (IoU={t75:.2f}): {ap75:.4f}")
+    logger.info(f"mAP50-95:           {map50_95:.4f}")
+
+    # 计算 VLM 常规指标（与 AP 互补）
+    vlm_metrics = compute_vlm_metrics(samples_for_eval)
+    logger.info(f"\n{'='*60}")
+    logger.info("VLM Quality Summary")
+    logger.info(f"{'='*60}")
+    logger.info(f"Parse success rate:    {vlm_metrics.parse_success_rate:.4f}")
+    logger.info(f"Strict format rate:    {vlm_metrics.strict_format_rate:.4f}")
+    logger.info(f"No-object reject rate: {vlm_metrics.no_object_rejection_rate:.4f}")
+    logger.info(f"Hallucination rate:    {vlm_metrics.hallucination_rate:.4f}")
+    logger.info(f"False reject rate:     {vlm_metrics.false_rejection_rate:.4f}")
+    logger.info(f"Omission rate:         {vlm_metrics.omission_rate:.4f}")
+    logger.info(f"Anomaly accuracy:      {vlm_metrics.anomaly_accuracy:.4f}")
+    logger.info(
+        f"Anomaly P/R/F1:        "
+        f"{vlm_metrics.anomaly_precision:.4f}/"
+        f"{vlm_metrics.anomaly_recall:.4f}/"
+        f"{vlm_metrics.anomaly_f1:.4f}"
+    )
+    logger.info(f"Category F1:           {vlm_metrics.category_f1:.4f}")
+    logger.info(f"Exact match rate:      {vlm_metrics.exact_match_rate:.4f}")
+    logger.info(f"Token F1:              {vlm_metrics.token_f1:.4f}")
+    logger.info(f"ROUGE-L F1:            {vlm_metrics.rouge_l_f1:.4f}")
+    logger.info(f"BLEU-1 / BLEU-4:       {vlm_metrics.bleu1:.4f} / {vlm_metrics.bleu4:.4f}")
+    logger.info(
+        f"Count MAE / RMSE:      "
+        f"{vlm_metrics.count_mae:.4f} / {vlm_metrics.count_rmse:.4f}"
+    )
+    logger.info(
+        f"Latency ms (mean/p50/p95): "
+        f"{vlm_metrics.latency_ms_mean:.1f}/{vlm_metrics.latency_ms_p50:.1f}/{vlm_metrics.latency_ms_p95:.1f}"
+    )
+
+    if output_dir:
+        summary_file = os.path.join(output_dir, "eval_summary.json")
+        per_class_summary = {}
+        all_classes = sorted(
+            {
+                cat
+                for per_iou in metrics_by_iou.values()
+                for cat in per_iou["per_class"].keys()
+            }
+        )
+
+        for cat in all_classes:
+            ap_list = []
+            for iou in iou_thresholds_sorted:
+                class_metric = metrics_by_iou[iou]["per_class"].get(cat)
+                if class_metric and class_metric.num_gt > 0:
+                    ap_list.append(class_metric.ap)
+
+            metric50 = metrics_by_iou[t50]["per_class"].get(cat, EvalMetrics())
+            metric75 = metrics_by_iou[t75]["per_class"].get(cat, EvalMetrics())
+            per_class_summary[cat] = {
+                "ap50": metric50.ap,
+                "ap75": metric75.ap,
+                "map50_95": float(np.mean(ap_list)) if ap_list else 0.0,
+                "precision@50": metric50.precision,
+                "recall@50": metric50.recall,
+                "f1@50": metric50.f1_score,
+                "num_gt": metric50.num_gt,
+                "num_pred": metric50.num_pred,
+            }
+
+        with open(summary_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {
                     "model_path": model_path,
                     "test_data": test_data_path,
-                    "num_samples": len(test_data),
-                    "iou_thresholds": iou_thresholds,
-                    "mAP": map_score,
+                    "num_samples": len(samples_for_eval),
+                    "iou_thresholds": iou_thresholds_sorted,
+                    "ap50": ap50,
+                    "ap75": ap75,
+                    "map50_95": map50_95,
+                    "overall@50": {
+                        "precision": metrics_by_iou[t50]["overall"].precision,
+                        "recall": metrics_by_iou[t50]["overall"].recall,
+                        "f1_score": metrics_by_iou[t50]["overall"].f1_score,
+                    },
                     "results_by_iou": {
                         str(iou): {
-                            "precision": all_metrics[iou]["overall"].precision,
-                            "recall": all_metrics[iou]["overall"].recall,
-                            "f1_score": all_metrics[iou]["overall"].f1_score,
+                            "ap": metrics_by_iou[iou]["overall"].ap,
+                            "precision": metrics_by_iou[iou]["overall"].precision,
+                            "recall": metrics_by_iou[iou]["overall"].recall,
+                            "f1_score": metrics_by_iou[iou]["overall"].f1_score,
                         }
-                        for iou in iou_thresholds
-                    }
-                }, f, indent=2, ensure_ascii=False)
-            logger.info(f"Summary saved to {summary_file}")
+                        for iou in iou_thresholds_sorted
+                    },
+                    "vlm_metrics": {
+                        "parse_success_rate": vlm_metrics.parse_success_rate,
+                        "strict_format_rate": vlm_metrics.strict_format_rate,
+                        "no_object_rejection_rate": vlm_metrics.no_object_rejection_rate,
+                        "hallucination_rate": vlm_metrics.hallucination_rate,
+                        "false_rejection_rate": vlm_metrics.false_rejection_rate,
+                        "omission_rate": vlm_metrics.omission_rate,
+                        "anomaly_accuracy": vlm_metrics.anomaly_accuracy,
+                        "anomaly_precision": vlm_metrics.anomaly_precision,
+                        "anomaly_recall": vlm_metrics.anomaly_recall,
+                        "anomaly_f1": vlm_metrics.anomaly_f1,
+                        "category_precision": vlm_metrics.category_precision,
+                        "category_recall": vlm_metrics.category_recall,
+                        "category_f1": vlm_metrics.category_f1,
+                        "exact_match_rate": vlm_metrics.exact_match_rate,
+                        "token_f1": vlm_metrics.token_f1,
+                        "rouge_l_f1": vlm_metrics.rouge_l_f1,
+                        "bleu1": vlm_metrics.bleu1,
+                        "bleu4": vlm_metrics.bleu4,
+                        "count_mae": vlm_metrics.count_mae,
+                        "count_rmse": vlm_metrics.count_rmse,
+                        "avg_response_tokens": vlm_metrics.avg_response_tokens,
+                        "avg_pred_boxes": vlm_metrics.avg_pred_boxes,
+                        "avg_gt_boxes": vlm_metrics.avg_gt_boxes,
+                        "latency_ms_mean": vlm_metrics.latency_ms_mean,
+                        "latency_ms_p50": vlm_metrics.latency_ms_p50,
+                        "latency_ms_p95": vlm_metrics.latency_ms_p95,
+                    },
+                    "per_class": per_class_summary,
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+        logger.info(f"Summary saved to {summary_file}")
 
 
 def main():
@@ -696,14 +1238,19 @@ def main():
         "--iou_threshold",
         type=float,
         default=0.5,
-        help="IoU threshold for matching (default: 0.5)"
+        help="Single IoU threshold for evaluation (default: 0.5)"
     )
     parser.add_argument(
         "--iou_thresholds",
         type=float,
         nargs="+",
         default=None,
-        help="Multiple IoU thresholds for mAP calculation (e.g., 0.5 0.75 0.9)"
+        help="Custom IoU thresholds (e.g., 0.5 0.75 0.9)"
+    )
+    parser.add_argument(
+        "--coco_map",
+        action="store_true",
+        help="Use COCO-style IoU thresholds: 0.50:0.05:0.95"
     )
 
     # Output arguments
@@ -717,10 +1264,14 @@ def main():
     args = parser.parse_args()
 
     # 确定 IoU 阈值
-    if args.iou_thresholds:
+    if args.coco_map:
+        iou_thresholds = COCO_IOU_THRESHOLDS
+    elif args.iou_thresholds:
         iou_thresholds = args.iou_thresholds
     else:
         iou_thresholds = [args.iou_threshold]
+
+    iou_thresholds = sorted(set(float(x) for x in iou_thresholds))
 
     # 运行评估
     run_evaluation(

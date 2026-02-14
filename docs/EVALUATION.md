@@ -1,34 +1,58 @@
 # 模型评估指南
 
-本项目提供了完整的目标检测评估工具，支持计算标准检测指标。
+本项目提供了完整的目标检测评估工具，支持 COCO/YOLO 风格 AP 计算。
 
 ## 评估指标
 
 ### 支持的指标
 
-1. **Precision (精确率)**: TP / (TP + FP)
+1. **AP50**
+   - IoU=0.50 下的平均精度（按类别求 AP 后再平均）
+   - 对应 YOLO 常见 `mAP@50`
+
+2. **AP75**
+   - IoU=0.75 下的平均精度
+   - 用于衡量更严格的定位质量
+
+3. **mAP50-95**
+   - IoU=0.50:0.05:0.95 的平均 AP（COCO 标准）
+   - 对应 YOLO 常见 `mAP@50-95`
+
+4. **Precision (精确率)**: TP / (TP + FP)
    - 预测为正例中真正为正例的比例
    - 衡量模型预测的准确性
 
-2. **Recall (召回率)**: TP / (TP + FN)
+5. **Recall (召回率)**: TP / (TP + FN)
    - 真实正例中被正确预测的比例
    - 衡量模型的检测完整性
 
-3. **F1-Score**: 2 × (Precision × Recall) / (Precision + Recall)
+6. **F1-Score**: 2 × (Precision × Recall) / (Precision + Recall)
    - Precision 和 Recall 的调和平均
    - 综合评估模型性能
 
-4. **mAP (mean Average Precision)**
-   - 多个 IoU 阈值下的平均精确率
-   - 目标检测的标准评估指标
-
-5. **IoU (Intersection over Union)**
+7. **IoU (Intersection over Union)**
    - 预测框和真实框的重叠度
    - 用于判断检测是否正确
 
-6. **Per-Class Metrics**
+8. **Per-Class Metrics**
    - 每个类别的独立指标
    - 分析不同类别的检测性能
+
+9. **VLM 常规指标（论文推荐）**
+   - `parse_success_rate`: 可解析输出比例
+   - `strict_format_rate`: 严格格式合规比例（序号+状态+box）
+   - `no_object_rejection_rate`: 无目标样本正确拒识率
+   - `hallucination_rate`: 无目标样本误检率
+   - `false_rejection_rate`: 有目标样本误拒率（错报“无目标”）
+   - `omission_rate`: 有目标样本完全漏检率（0 框输出）
+   - `anomaly_accuracy`: 异常/正常判断准确率
+   - `anomaly_precision/recall/f1`: 异常检测二分类指标
+   - `category_precision/recall/f1`: 类别文本匹配指标
+   - `exact_match_rate`: 预测文本与参考文本归一化后完全一致比例
+   - `token_f1`: 词级重叠 F1（SQuAD 风格）
+   - `ROUGE-L F1`, `BLEU-1`, `BLEU-4`: 文本质量指标
+   - `count_mae`, `count_rmse`: 目标数量误差指标
+   - `latency_ms_mean/p50/p95`: 推理时延统计
 
 ## 快速开始
 
@@ -55,8 +79,12 @@ python scripts/evaluate.py \
 ### 2. 计算 mAP
 
 ```bash
-# 计算多个 IoU 阈值的 mAP
-COMPUTE_MAP=true ./scripts/run/evaluate.sh
+# 计算 COCO 风格 mAP（推荐）
+python scripts/evaluate.py \
+    --model_path outputs/qwen3vl_lora \
+    --test_data data/qwen_data/test.json \
+    --coco_map \
+    --output_dir eval_results/
 
 # 或指定自定义阈值
 python scripts/evaluate.py \
@@ -115,6 +143,7 @@ python scripts/evaluate.py \
 - `--output_dir`: 评估结果保存目录
 - `--iou_threshold`: 单个 IoU 阈值（默认 0.5）
 - `--iou_thresholds`: 多个 IoU 阈值，用于计算 mAP
+- `--coco_map`: 使用 COCO 阈值 0.50:0.05:0.95
 - `--max_samples`: 限制评估样本数量（用于快速测试）
 - `--no_4bit`: 禁用 4-bit 量化（需要更多显存）
 
@@ -155,7 +184,7 @@ eval_results/
 ├── eval_results_iou0.50.json    # IoU=0.5 的详细结果
 ├── eval_results_iou0.75.json    # IoU=0.75 的详细结果
 ├── eval_results_iou0.90.json    # IoU=0.9 的详细结果
-└── eval_summary.json             # 总结（包含 mAP）
+└── eval_summary.json             # 总结（包含 AP50/AP75/mAP50-95）
 ```
 
 ### 结果文件格式
@@ -164,6 +193,7 @@ eval_results/
 {
   "iou_threshold": 0.5,
   "overall": {
+    "ap": 0.8011,
     "precision": 0.8523,
     "recall": 0.7891,
     "f1_score": 0.8193,
@@ -175,6 +205,7 @@ eval_results/
   },
   "per_class": {
     "交通信号灯": {
+      "ap": 0.8614,
       "precision": 0.9012,
       "recall": 0.8456,
       "f1_score": 0.8725,
@@ -183,6 +214,7 @@ eval_results/
       "fn": 22
     },
     "交通诱导屏": {
+      "ap": 0.7421,
       "precision": 0.8234,
       "recall": 0.7123,
       "f1_score": 0.7634,
@@ -190,6 +222,39 @@ eval_results/
       "fp": 19,
       "fn": 36
     }
+  }
+}
+```
+
+`eval_summary.json` 还会额外包含：
+
+```json
+{
+  "ap50": 0.8123,
+  "ap75": 0.6034,
+  "map50_95": 0.5211,
+  "vlm_metrics": {
+    "parse_success_rate": 0.94,
+    "strict_format_rate": 0.90,
+    "no_object_rejection_rate": 0.88,
+    "hallucination_rate": 0.12,
+    "false_rejection_rate": 0.07,
+    "omission_rate": 0.09,
+    "anomaly_accuracy": 0.86,
+    "anomaly_precision": 0.84,
+    "anomaly_recall": 0.81,
+    "anomaly_f1": 0.82,
+    "category_f1": 0.79,
+    "exact_match_rate": 0.41,
+    "token_f1": 0.74,
+    "rouge_l_f1": 0.72,
+    "bleu1": 0.76,
+    "bleu4": 0.48,
+    "count_mae": 0.31,
+    "count_rmse": 0.58,
+    "latency_ms_mean": 820.4,
+    "latency_ms_p50": 790.1,
+    "latency_ms_p95": 1102.7
   }
 }
 ```

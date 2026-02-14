@@ -95,6 +95,68 @@ python gradio_app.py
 docker-compose up -d
 ```
 
+## 训练（SFT / GRPO）
+
+### 1. 安装训练依赖
+
+```bash
+pip install -r requirements_finetune.txt
+```
+
+> `requirements_finetune.txt` 已包含 `trl`，用于 `GRPOTrainer` 训练。
+
+### 2. 数据格式要求（重要）
+
+- 训练数据采用 Qwen-VL 对话格式（`image + conversations`），可用 `scripts/data/cvat_to_qwenvl.py` 转换。
+- 对于“图中无相关设备”的样本，`assistant` 建议明确输出：`未检测到相关设备。`
+- GRPO 奖励已使用严格格式门控：格式不合法时，其它奖励项不会生效。
+
+### 3. SFT（LoRA/QLoRA）
+
+```bash
+./scripts/run/train_lora.sh
+```
+
+### 4. GRPO（推荐 TRL 版本）
+
+```bash
+./scripts/run/train_grpo_trl.sh
+```
+
+可选：自定义实现版本
+
+```bash
+./scripts/run/train_grpo.sh
+```
+
+### 5. 训练日志可视化
+
+```bash
+python scripts/visualize_training_log.py \
+  --log outputs/qwen3vl_grpo_trl/training_log.json \
+  --output outputs/qwen3vl_grpo_trl/plots
+```
+
+## 评估（可用于论文）
+
+检测评估与 VLM 质量评估统一在 `scripts/evaluate.py` 中，结果会写入 `eval_summary.json`。
+
+```bash
+python scripts/evaluate.py \
+  --model_path outputs/qwen3vl_lora \
+  --test_data data/qwen_data/test.json \
+  --coco_map \
+  --output_dir eval_results/lora
+```
+
+支持的核心指标：
+- 检测指标：`AP50` / `AP75` / `mAP50-95`（COCO/YOLO 风格）
+- VLM 指标：`parse_success_rate`、`strict_format_rate`、`hallucination_rate`
+- 论文常用补充：`exact_match_rate`、`token_f1`、`ROUGE-L F1`、`BLEU-1/4`
+- 任务相关补充：`anomaly_precision/recall/f1`、`count_mae/rmse`、时延 `latency_ms_mean/p50/p95`
+
+详细说明见：`docs/EVALUATION.md`
+
 ## 使用方式
 
 ### Web 界面（推荐新手使用）

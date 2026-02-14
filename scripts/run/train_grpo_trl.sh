@@ -130,6 +130,6 @@ echo ""
 echo "训练完成后，可以使用以下命令查看训练曲线："
 echo "  tensorboard --logdir $OUTPUT_DIR"
 echo "  或"
-echo "  python scripts/visualize_training.py --logdir $OUTPUT_DIR --export"
+echo "  python scripts/visualize_training_log.py --log $OUTPUT_DIR/training_log.json --output $OUTPUT_DIR/plots"
 echo ""
 eval $CMD

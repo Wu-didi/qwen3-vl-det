@@ -49,6 +49,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+NO_DETECTION_PATTERNS = [
+    "未检测到相关设备",
+    "未检测到设备",
+    "未检测到目标",
+    "没有检测到",
+    "no relevant equipment",
+    "no equipment detected",
+]
+
 
 def get_model_class(model_path: str):
     """根据模型路径返回对应的模型类"""
@@ -128,6 +137,12 @@ class RewardCalculator:
 
     def __init__(self, config: GRPOConfig):
         self.config = config
+
+    @staticmethod
+    def is_no_detection_response(text: str) -> bool:
+        """Check whether model output explicitly declares no detections."""
+        text_lower = text.lower()
+        return any(pattern in text_lower for pattern in NO_DETECTION_PATTERNS)
 
     def parse_box_format(self, text: str) -> List[Dict]:
         """
@@ -242,12 +257,18 @@ class RewardCalculator:
 
         # 1. 格式正确性奖励 (作为 gating 机制)
         # 检查是否有完整的检测格式：序号 + 状态 + box
+        gt_is_empty = len(gt_detections) == 0
         has_box = len(pred_detections) > 0
         has_numbered = bool(re.search(r'\d+\.\s+\S+', generated_text))
         has_status = bool(re.search(r'状态[：:]\s*\S+', generated_text))
+        is_no_detection = self.is_no_detection_response(generated_text)
 
-        # Gating: 只有格式完整才给奖励，否则为 0
-        format_valid = has_box and has_numbered and has_status
+        # Gating: 格式必须是以下两种之一
+        #   1) 标准结构化检测输出（含序号、状态、box）
+        #   2) GT 本身无目标时，明确输出“未检测到相关设备”
+        format_valid = (has_box and has_numbered and has_status) or (
+            gt_is_empty and not has_box and is_no_detection
+        )
         if format_valid:
             rewards["format"] = 1.0  # 格式正确，允许其他奖励生效
         else:
@@ -256,12 +277,17 @@ class RewardCalculator:
             return 0.0, rewards
 
         # 如果没有真实检测
-        if not gt_detections:
+        if gt_is_empty:
             if not pred_detections:
                 # 正确预测没有设备
-                rewards["bbox"] = 1.0
-                rewards["category"] = 1.0
-                rewards["completeness"] = 1.0
+                if is_no_detection:
+                    rewards["bbox"] = 1.0
+                    rewards["category"] = 1.0
+                    rewards["completeness"] = 1.0
+                else:
+                    rewards["bbox"] = 0.6
+                    rewards["category"] = 0.6
+                    rewards["completeness"] = 0.6
             else:
                 # 预测了不存在的设备 (false positive)
                 rewards["bbox"] = -0.3
@@ -469,16 +495,16 @@ class GRPODataset(Dataset):
 
         # 如果没匹配到完整格式，尝试只提取 box
         if not detections:
-            box_pattern = r'<box>\s*\((\d+)\s*,\s*(\d+)\)\s*,\s*\((\d+)\s*,\s*(\d+)\)\s*</box>'
+            box_pattern = r'<box>\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*,\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*</box>'
             simple_matches = re.findall(box_pattern, response)
             for match in simple_matches:
                 try:
-                    x1, y1, x2, y2 = int(match[0]), int(match[1]), int(match[2]), int(match[3])
+                    x1, y1, x2, y2 = int(float(match[0])), int(float(match[1])), int(float(match[2])), int(float(match[3]))
                     detections.append({
                         "category": "unknown",
                         "bbox": [x1, y1, x2, y2]
                     })
-                except ValueError:
+                except (ValueError, TypeError):
                     continue
 
         has_anomaly = any(d.get("is_anomaly", False) for d in detections)
@@ -517,13 +543,19 @@ class GRPOTrainer:
 
         # ✅ 新增：Warmup scheduler
         warmup_steps = int(total_steps * config.warmup_ratio)
-        self.scheduler = torch.optim.lr_scheduler.LinearLR(
-            self.optimizer,
-            start_factor=0.1,  # 从 10% 学习率开始
-            end_factor=1.0,
-            total_iters=warmup_steps,
-        )
-        logger.info(f"Warmup scheduler: {warmup_steps} steps (ratio={config.warmup_ratio})")
+        if warmup_steps > 0:
+            self.scheduler = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer,
+                start_factor=0.1,  # 从 10% 学习率开始
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            logger.info(f"Warmup scheduler: {warmup_steps} steps (ratio={config.warmup_ratio})")
+        else:
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer, lr_lambda=lambda _: 1.0
+            )
+            logger.info("Warmup scheduler disabled (warmup_steps=0)")
 
         self.global_step = 0
         self.best_val_reward = float('-inf')  # 记录最佳验证 reward
@@ -694,14 +726,15 @@ class GRPOTrainer:
         # Forward pass
         outputs = model(**inputs, labels=labels)
 
-        # ✅ 关键修复2: 计算有效 token 数量并返回总 log prob
-        valid_tokens = (labels != -100).sum().float()
+        # 计算有效 token 数量并返回“每 token 平均 log prob”
+        # 这样 KL 惩罚不会被输出长度放大，更稳定。
+        valid_tokens = (labels != -100).sum().float().clamp(min=1.0)
 
-        # outputs.loss 是平均 negative log likelihood
-        # 我们需要总的 log probability
+        # outputs.loss 是平均 negative log likelihood（仅统计 labels != -100）
         total_log_prob = -outputs.loss * valid_tokens
+        avg_log_prob = total_log_prob / valid_tokens
 
-        return total_log_prob
+        return avg_log_prob
 
     def grpo_step(
         self,
@@ -1462,7 +1495,11 @@ def main():
 
     # ✅ 计算总步数（用于 warmup scheduler）
     total_samples = len(dataset) * config.num_epochs
-    total_steps = total_samples // config.gradient_accumulation_steps
+    total_steps = max(
+        1,
+        (total_samples + config.gradient_accumulation_steps - 1)
+        // config.gradient_accumulation_steps,
+    )
     logger.info(f"Total training steps: {total_steps} (samples: {total_samples})")
 
     # 创建奖励计算器
