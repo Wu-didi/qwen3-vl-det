@@ -85,14 +85,14 @@ python scripts/data/cvat_to_qwenvl.py \
     --output-dir data/qwen_data
 
 # Run LoRA fine-tuning (QLoRA by default)
-python scripts/training/finetune_qwen_vl.py \
+python scripts/training/sft/finetune_qwen_vl.py \
     --model_path Qwen/Qwen3-VL-2B-Instruct \
     --train_data data/qwen_data/train.json \
     --val_data data/qwen_data/val.json \
     --output_dir outputs/qwen3vl_lora
 
 # Run GRPO (reinforcement learning) fine-tuning
-python scripts/training/grpo_finetune.py \
+python scripts/training/rft/grpo_finetune.py \
     --model_path Qwen/Qwen3-VL-2B-Instruct \
     --train_data data/qwen_data/train.json \
     --val_data data/qwen_data/val.json \
@@ -264,13 +264,13 @@ GRPO training includes a **usability self-check** mechanism to prevent "fake tra
 **Configuration**:
 ```bash
 # Enable usability check (default)
-python scripts/training/grpo_finetune.py \
+python scripts/training/rft/grpo_finetune.py \
     --train_data data.json \
     --usability_check_steps 200 \
     --usability_check_samples 8
 
 # Disable usability check
-python scripts/training/grpo_finetune.py \
+python scripts/training/rft/grpo_finetune.py \
     --train_data data.json \
     --usability_check_steps 0
 
@@ -326,10 +326,10 @@ See [TRAINING_LOGS.md](TRAINING_LOGS.md) for detailed documentation.
 
 ```bash
 # Method 1: Don't provide --val_data
-python scripts/training/grpo_finetune.py --train_data data.json --output_dir outputs/
+python scripts/training/rft/grpo_finetune.py --train_data data.json --output_dir outputs/
 
 # Method 2: Set --eval_steps 0
-python scripts/training/grpo_finetune.py --train_data data.json --val_data val.json --eval_steps 0
+python scripts/training/rft/grpo_finetune.py --train_data data.json --val_data val.json --eval_steps 0
 
 # Method 3: In shell scripts, set VAL_DATA="" or EVAL_STEPS=0
 ```
@@ -340,13 +340,13 @@ All training scripts now use `--no_*` flags to disable default-enabled features:
 
 ```bash
 # Disable 4-bit quantization (use full precision LoRA)
-python scripts/training/finetune_qwen_vl.py --train_data data.json --no_4bit
+python scripts/training/sft/finetune_qwen_vl.py --train_data data.json --no_4bit
 
 # Disable bfloat16 (use float16 instead)
-python scripts/training/finetune_qwen_vl.py --train_data data.json --no_bf16
+python scripts/training/sft/finetune_qwen_vl.py --train_data data.json --no_bf16
 
 # Disable gradient checkpointing (faster but more VRAM)
-python scripts/training/finetune_qwen_vl.py --train_data data.json --no_gradient_checkpointing
+python scripts/training/sft/finetune_qwen_vl.py --train_data data.json --no_gradient_checkpointing
 
 # In shell scripts
 DISABLE_4BIT=true ./scripts/run/train_lora.sh

@@ -6,7 +6,7 @@ GRPO 是一种高效的强化学习微调方法，通过组内相对优势来优
 不需要单独的奖励模型。
 
 Usage:
-    python scripts/grpo_finetune.py \
+    python scripts/training/grpo_finetune.py \
         --model_path Qwen/Qwen3-VL-2B-Instruct \
         --train_data data/qwen_data/train.json \
         --output_dir outputs/qwen3vl_grpo
@@ -14,6 +14,15 @@ Usage:
 References:
     - DeepSeekMath: https://arxiv.org/abs/2402.03300
     - TRL GRPO: https://huggingface.co/docs/trl/grpo_trainer
+
+说明：
+这是“手写版”GRPO实现，目标是便于调试和快速迭代奖励函数。
+整体流程：
+1) 采样多条响应
+2) 奖励函数打分
+3) 组内优势归一化
+4) PPO clipping + KL 惩罚
+5) 梯度累积更新
 """
 
 import os
@@ -72,14 +81,17 @@ def get_model_class(model_path: str):
 
 @dataclass
 class GRPOConfig:
-    """GRPO training configuration."""
-    # Model
+    """GRPO 训练配置。"""
+    # 配置设计说明：
+    # - 尽量把“可频繁调参”的项都集中在 dataclass，方便实验复现；
+    # - 默认按低显存场景设置（4bit + batch_size=1 + 梯度累积）。
+    # 模型参数
     model_path: str = "Qwen/Qwen3-VL-2B-Instruct"
     sft_model_path: str = ""  # SFT 微调后的 LoRA 模型路径 (可选)
     use_4bit: bool = True
     use_8bit: bool = False
 
-    # LoRA
+    # LoRA 参数
     lora_r: int = 64
     lora_alpha: int = 16
     lora_dropout: float = 0.1
@@ -88,20 +100,20 @@ class GRPOConfig:
         "gate_proj", "up_proj", "down_proj"
     ])
 
-    # Data
+    # 数据参数
     train_data: str = "data/qwen_data/train.json"
     val_data: str = ""  # 验证集路径（可选）
     max_length: int = 2048
     max_new_tokens: int = 512  # 检测 JSON 输出通常不需要太长
     max_image_size: int = 512  # 图片最大边长
 
-    # GRPO specific
+    # GRPO 专有参数
     num_generations: int = 4  # 每个样本生成的响应数量 (G)
     temperature: float = 0.7  # 生成时的温度
     kl_coef: float = 0.1  # KL 散度系数
-    clip_range: float = 0.2  # PPO-style clipping
+    clip_range: float = 0.2  # PPO 风格裁剪阈值
 
-    # Training
+    # 训练参数
     output_dir: str = "outputs/qwen3vl_grpo"
     num_epochs: int = 1
     batch_size: int = 1  # 每个 batch 的样本数
@@ -116,31 +128,31 @@ class GRPOConfig:
     usability_check_samples: int = 8  # 可用性自检的抽样数量
     max_grad_norm: float = 1.0
 
-    # Reward weights (strict gating design)
-    # - format: acts as STRICT GATE - if format invalid (0), all other rewards forced to 0
-    # - bbox: high weight (3.0) for accurate localization (only active when format valid)
-    # - category: medium weight (2.0) for correct classification (only active when format valid)
-    # - completeness: medium weight (2.0) for detection completeness (only active when format valid)
-    # Note: format_weight can be low since gating is enforced by early return, not by weight
-    reward_format_weight: float = 0.2  # 格式正确性权重 (strict gate)
+    # 奖励权重（严格门控设计）：
+    # - format：严格门控，格式不合法时其余奖励强制归零
+    # - bbox：定位精度权重（格式合法时生效）
+    # - category：类别准确率权重（格式合法时生效）
+    # - completeness：检测完整性权重（格式合法时生效）
+    # 说明：format 权重可较低，关键在于其门控逻辑本身
+    reward_format_weight: float = 0.2  # 格式正确性权重（严格门控）
     reward_bbox_weight: float = 3.0    # 边界框准确性权重
     reward_category_weight: float = 2.0  # 类别准确性权重
     reward_confidence_weight: float = 2.0  # 完整性权重
 
-    # Other
+    # 其他参数
     seed: int = 42
     bf16: bool = True
 
 
 class RewardCalculator:
-    """计算检测结果的奖励分数"""
+    """计算检测任务奖励分数（含严格格式门控）。"""
 
     def __init__(self, config: GRPOConfig):
         self.config = config
 
     @staticmethod
     def is_no_detection_response(text: str) -> bool:
-        """Check whether model output explicitly declares no detections."""
+        """判断模型输出是否明确声明“未检测到设备”语义。"""
         text_lower = text.lower()
         return any(pattern in text_lower for pattern in NO_DETECTION_PATTERNS)
 
@@ -243,6 +255,11 @@ class RewardCalculator:
         Returns:
             total_reward: 总奖励分数
             reward_breakdown: 各项奖励分解
+
+        设计约束：
+        - 所有子奖励都尽量映射到 [-1, 1]，避免某一项数值范围过大“淹没”其它项；
+        - 格式奖励是硬门控（格式不合法时直接返回 0），优先保证输出可解析性；
+        - 最终 reward 为加权和，权重由配置控制。
         """
         rewards = {
             "format": 0.0,
@@ -356,7 +373,14 @@ class RewardCalculator:
 
 
 class GRPODataset(Dataset):
-    """GRPO 训练数据集"""
+    """GRPO 训练数据集。
+
+    输出字段约定：
+    - image: PIL.Image（保留为图像对象，避免提前转 tensor）
+    - prompt: 用户文本输入（已清理 <image> 占位符）
+    - ground_truth: 结构化真值（用于 reward 计算）
+    - reference_response: 参考回答文本（用于调试/核对）
+    """
 
     def __init__(self, data_path: str, processor, max_length: int = 2048, max_image_size: int = 512):
         self.processor = processor
@@ -377,14 +401,14 @@ class GRPODataset(Dataset):
         image_path = item["image"]
         conversations = item["conversations"]
 
-        # Load image
+        # 加载图像
         try:
             image = Image.open(image_path).convert("RGB")
             # 限制图片大小以减少显存占用
             if self.max_image_size and max(image.size) > self.max_image_size:
                 ratio = self.max_image_size / max(image.size)
                 new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
-                # Handle Pillow version compatibility
+                # 兼容 Pillow 不同版本
                 try:
                     resample = Image.Resampling.LANCZOS  # Pillow 10+
                 except AttributeError:
@@ -414,22 +438,22 @@ class GRPODataset(Dataset):
             elif role == "assistant":
                 assistant_messages.append(text)
 
-        # 对于 GRPO，我们需要：
-        # - prompt: 最后一条 user 消息（或拼接所有 user 消息）
-        # - reference_response: 最后一条 assistant 消息
+        # 对于 GRPO，训练样本至少需要两项：
+        # - prompt: user 侧输入（通常取最后一条）
+        # - reference_response: assistant 侧参考答案（用于奖励计算）
         if not user_messages or not assistant_messages:
             logger.warning(
                 f"Sample {idx}: missing user or assistant messages in conversations. "
                 f"Found {len(user_messages)} user messages and {len(assistant_messages)} assistant messages. "
                 f"Attempting fallback by assuming first message is user and second is assistant."
             )
-            # 回退：假设前两条消息分别是 user 和 assistant（不依赖 from 字段）
+            # 回退策略：假设前两条消息分别为 user / assistant（不依赖 from 字段）
             if len(conversations) >= 2:
                 user_msg = conversations[0].get("value", "").replace("<image>\n", "").replace("<image>", "")
                 assistant_msg = conversations[1].get("value", "")
             else:
                 logger.error(f"Sample {idx}: insufficient conversations, skipping")
-                # 返回空数据，让 DataLoader 跳过
+                # 返回空样本，后续在训练循环中自动跳过
                 return {
                     "image": Image.new("RGB", (224, 224)),
                     "prompt": "",
@@ -437,8 +461,8 @@ class GRPODataset(Dataset):
                     "reference_response": "",
                 }
         else:
-            # 使用最后一条 user 消息作为 prompt（对于单轮检测任务）
-            # 如果需要多轮上下文，可以改为拼接所有消息
+            # 单轮任务默认使用最后一条 user 消息作为 prompt；
+            # 若未来做多轮任务，可改为拼接上下文。
             user_msg = user_messages[-1]
             assistant_msg = assistant_messages[-1]
 
@@ -447,7 +471,7 @@ class GRPODataset(Dataset):
 
         return {
             "image": image,
-            "prompt": user_msg,  # 已经在上面处理过 <image> 占位符了
+            "prompt": user_msg,  # 此处的文本已移除 <image> 占位符
             "ground_truth": ground_truth,
             "reference_response": assistant_msg,
         }
@@ -517,7 +541,13 @@ class GRPODataset(Dataset):
 
 
 class GRPOTrainer:
-    """GRPO 训练器"""
+    """GRPO 训练器（手写训练循环版本）。
+
+    与通用 Trainer 的主要差异：
+    - 强化学习每个样本会先生成多条响应，再按组计算优势；
+    - 通过参考模型计算 KL 惩罚，控制策略漂移；
+    - 支持周期性验证与可用性自检（避免“reward涨但不可用”）。
+    """
 
     def __init__(
         self,
@@ -568,6 +598,7 @@ class GRPOTrainer:
             "usability_history": [],  # 可用性自检历史
             "best_checkpoint": None,
         }
+        # training_log 会持续增量写盘，便于中断恢复后复盘。
 
     @torch.no_grad()
     def generate_responses(
@@ -577,7 +608,7 @@ class GRPOTrainer:
         num_generations: int,
     ) -> List[str]:
         """为单个样本生成多个响应"""
-        # 生成时需要切换到 eval 模式，避免 gradient checkpointing 干扰
+        # 生成阶段切到 eval，避免梯度检查点等训练态副作用
         was_training = self.model.training
         self.model.eval()
 
@@ -601,9 +632,9 @@ class GRPOTrainer:
             text=[text],
             images=[image],
             return_tensors="pt",
-            padding=False,  # Single sample, no padding needed
-            truncation=True,  # Enable truncation to prevent OOM
-            max_length=self.config.max_length,  # Use configured max_length
+            padding=False,  # 单样本无需 padding
+            truncation=True,  # 启用截断，防止 OOM
+            max_length=self.config.max_length,  # 使用配置中的最大长度
         ).to(self.model.device)
 
         # 批量生成所有响应 (更高效)
@@ -678,6 +709,8 @@ class GRPOTrainer:
         response: str,
     ) -> torch.Tensor:
         """计算给定响应的 log 概率（修复版：正确 mask prompt + 返回总和）"""
+        # 这里显式构造「user -> assistant」完整上下文，
+        # 目的是让 log-prob 计算与真实生成场景一致。
         messages = [
             {
                 "role": "user",
@@ -704,9 +737,9 @@ class GRPOTrainer:
             text=[text],
             images=[image],
             return_tensors="pt",
-            padding=False,  # Single sample, no padding needed
-            truncation=True,  # Enable truncation to prevent OOM
-            max_length=self.config.max_length,  # Use configured max_length
+            padding=False,  # 单样本无需 padding
+            truncation=True,  # 启用截断，防止 OOM
+            max_length=self.config.max_length,  # 使用配置中的最大长度
         ).to(model.device)
 
         # ✅ 关键修复1: 创建 labels 并 mask prompt 部分
@@ -715,25 +748,26 @@ class GRPOTrainer:
         # 找到 assistant 开始位置
         assistant_start = self._find_assistant_start(inputs["input_ids"][0])
 
-        # Mask prompt 部分（只训练 assistant 的回复）
+        # mask 掉 prompt，仅训练 assistant 回复
         labels[0, :assistant_start] = -100
 
-        # Mask padding tokens
+        # mask 掉 padding token
         pad_token_id = self.processor.tokenizer.pad_token_id
         if pad_token_id is not None:
             labels[labels == pad_token_id] = -100
 
-        # Forward pass
+        # 前向计算
         outputs = model(**inputs, labels=labels)
 
         # 计算有效 token 数量并返回“每 token 平均 log prob”
         # 这样 KL 惩罚不会被输出长度放大，更稳定。
         valid_tokens = (labels != -100).sum().float().clamp(min=1.0)
 
-        # outputs.loss 是平均 negative log likelihood（仅统计 labels != -100）
+        # outputs.loss 是平均 NLL（仅统计 labels != -100）
         total_log_prob = -outputs.loss * valid_tokens
         avg_log_prob = total_log_prob / valid_tokens
 
+        # 返回“每 token 平均 log-prob”，可降低长度差异对 KL 的影响。
         return avg_log_prob
 
     def grpo_step(
@@ -743,6 +777,8 @@ class GRPOTrainer:
         ground_truth: Dict,
     ) -> Dict[str, float]:
         """执行单个 GRPO 更新步骤（修复版：添加 PPO clipping）"""
+        # 单步数据流：
+        # generate -> reward -> advantage -> policy/kl loss -> backward
         step_start = time.time()
 
         # 1. 生成多个响应
@@ -764,7 +800,7 @@ class GRPOTrainer:
 
         rewards = torch.tensor(rewards, device=self.model.device)
 
-        # 3. 计算组内相对优势 (Group Relative Advantage)
+        # 3. 计算组内相对优势（Group Relative Advantage）
         mean_reward = rewards.mean()
         std_reward = rewards.std() + 1e-8
         advantages = (rewards - mean_reward) / std_reward
@@ -775,13 +811,13 @@ class GRPOTrainer:
             old_log_probs = []
             ref_log_probs = []
             for response in responses:
-                # 当前策略的初始 log prob
+                # 当前策略的初始 log-prob
                 old_log_prob = self.compute_log_probs(
                     self.model, image, prompt, response
                 )
                 old_log_probs.append(old_log_prob)
 
-                # 参考策略的 log prob
+                # 参考策略的 log-prob
                 ref_log_prob = self.compute_log_probs(
                     self.ref_model, image, prompt, response
                 )
@@ -792,7 +828,7 @@ class GRPOTrainer:
         kl_divs = []
 
         for i, (response, advantage) in enumerate(zip(responses, advantages)):
-            # 当前策略的 log 概率（可训练）
+            # 当前策略的 log-prob（参与梯度）
             log_prob = self.compute_log_probs(
                 self.model, image, prompt, response
             )
@@ -1055,6 +1091,8 @@ class GRPOTrainer:
     def train(self, dataset: GRPODataset, val_dataset: GRPODataset = None):
         """训练循环（修复版：正确的梯度累积顺序）"""
         logger.info("Starting GRPO training...")
+        # 注意：这里的“step”指优化器步数，不是样本数。
+        # 样本数用 total_samples 单独统计，用于按样本频率保存 checkpoint。
 
         # 自定义 collate_fn，保留 PIL Image 不做转换
         def collate_fn(batch):
@@ -1265,6 +1303,7 @@ class GRPOTrainer:
         os.makedirs(save_path, exist_ok=True)
 
         # 保存 LoRA 权重
+        # 注意：这里只保存 adapter（PEFT），不会导出完整基座参数。
         self.model.save_pretrained(save_path)
         self.processor.save_pretrained(save_path)
 
@@ -1378,6 +1417,7 @@ def create_reference_model(config: GRPOConfig):
         logger.info("Reference model: Using PEFT adapter (not merged for safety)")
 
     # 冻结参考模型
+    # 参考模型只用于 KL 对齐，不参与反向传播。
     ref_model.eval()
     for param in ref_model.parameters():
         param.requires_grad = False
@@ -1386,9 +1426,10 @@ def create_reference_model(config: GRPOConfig):
 
 
 def main():
+    # main 负责：参数解析 -> 配置构建 -> 模型/数据初始化 -> 启动训练。
     parser = argparse.ArgumentParser(description="GRPO fine-tuning for Qwen-VL")
 
-    # Model arguments
+    # -------------------- 模型参数 --------------------
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-VL-2B-Instruct")
     parser.add_argument("--sft_model_path", type=str, default="",
                         help="Path to SFT fine-tuned LoRA model (optional, for continuing from SFT)")
@@ -1397,12 +1438,12 @@ def main():
     parser.add_argument("--use_8bit", action="store_true", default=False,
                         help="Use 8-bit quantization")
 
-    # LoRA arguments
+    # -------------------- LoRA 参数 --------------------
     parser.add_argument("--lora_r", type=int, default=64)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.1)
 
-    # Data arguments
+    # -------------------- 数据参数 --------------------
     parser.add_argument("--train_data", type=str, required=True)
     parser.add_argument("--val_data", type=str, default="",
                         help="Path to validation data (optional)")
@@ -1410,12 +1451,12 @@ def main():
     parser.add_argument("--max_image_size", type=int, default=512,
                         help="Maximum image size (longest edge)")
 
-    # GRPO arguments
+    # -------------------- GRPO 参数 --------------------
     parser.add_argument("--num_generations", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--kl_coef", type=float, default=0.1)
 
-    # Training arguments
+    # -------------------- 训练参数 --------------------
     parser.add_argument("--output_dir", type=str, default="outputs/qwen3vl_grpo")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1,
@@ -1431,7 +1472,7 @@ def main():
     parser.add_argument("--usability_check_samples", type=int, default=8,
                         help="Number of samples for usability check")
 
-    # Other
+    # -------------------- 其他参数 --------------------
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no_bf16", action="store_false", dest="bf16", default=True,
                         help="Disable bfloat16. Default: enabled")

@@ -55,7 +55,7 @@ echo "Epochs: $NUM_EPOCHS"
 echo "Learning Rate: $LEARNING_RATE"
 echo "=========================================="
 
-CMD="python scripts/training/finetune_qwen_vl.py \
+CMD="python scripts/training/sft/finetune_qwen_vl.py \
     --model_path $MODEL_PATH \
     --train_data $TRAIN_DATA \
     --val_data $VAL_DATA \

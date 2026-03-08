@@ -44,7 +44,7 @@
 ./scripts/run/train_grpo.sh
 
 # 或直接调用 Python
-python scripts/training/grpo_finetune.py \
+python scripts/training/rft/grpo_finetune.py \
     --train_data data/qwen_data/train.json \
     --val_data data/qwen_data/val.json \
     --output_dir outputs/qwen3vl_grpo \
@@ -59,7 +59,7 @@ python scripts/training/grpo_finetune.py \
 USABILITY_CHECK_STEPS=100 USABILITY_CHECK_SAMPLES=16 ./scripts/run/train_grpo.sh
 
 # 或
-python scripts/training/grpo_finetune.py \
+python scripts/training/rft/grpo_finetune.py \
     --train_data data.json \
     --usability_check_steps 100 \
     --usability_check_samples 16
@@ -72,7 +72,7 @@ python scripts/training/grpo_finetune.py \
 USABILITY_CHECK_STEPS=0 ./scripts/run/train_grpo.sh
 
 # 或
-python scripts/training/grpo_finetune.py \
+python scripts/training/rft/grpo_finetune.py \
     --train_data data.json \
     --usability_check_steps 0
 ```

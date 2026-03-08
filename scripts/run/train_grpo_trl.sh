@@ -99,7 +99,7 @@ echo "LoRA R: $LORA_R"
 echo "Reward scheme: $REWARD_SCHEME"
 echo "=========================================="
 
-CMD="python scripts/training/grpo_finetune_trl.py \
+CMD="python scripts/training/rft/grpo_finetune_trl.py \
     --model_path $MODEL_PATH \
     --train_data $TRAIN_DATA \
     --output_dir $OUTPUT_DIR \

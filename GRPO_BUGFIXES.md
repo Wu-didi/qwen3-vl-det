@@ -13,7 +13,7 @@ This document describes critical bug fixes applied to the GRPO (Group Relative P
 
 ### Problem
 
-**File**: `scripts/training/qwen_grpo_trainer.py:282-286`
+**File**: `scripts/training/rft/qwen_grpo_trainer.py:282-286`
 
 The advantages tensor was being sliced incorrectly for distributed training:
 
@@ -91,8 +91,8 @@ box = [int(float(match.group(i))) for i in range(1, 5)]
 ```
 
 **Files Updated**:
-- `scripts/training/grpo_finetune_trl.py`
-- `scripts/training/grpo_finetune.py`
+- `scripts/training/rft/grpo_finetune_trl.py`
+- `scripts/training/rft/grpo_finetune.py`
 - `scripts/evaluate.py`
 - `gradio_app.py`
 - `scripts/data/generate_dpo_data.py`
@@ -215,15 +215,15 @@ reward_weights = [0.2, 3.0, 2.0, 2.0]  # Total: 7.2
 ## Files Modified
 
 ### Training Scripts
-1. **`scripts/training/qwen_grpo_trainer.py`**
+1. **`scripts/training/rft/qwen_grpo_trainer.py`**
    - Fixed advantages slicing (line 281-287)
 
-2. **`scripts/training/grpo_finetune_trl.py`**
+2. **`scripts/training/rft/grpo_finetune_trl.py`**
    - Fixed box extraction regex (line 212-220)
    - Implemented format reward gating (line 67-103)
    - Rebalanced reward weights (line 617)
 
-3. **`scripts/training/grpo_finetune.py`**
+3. **`scripts/training/rft/grpo_finetune.py`**
    - Fixed box extraction regex (multiple locations)
    - Implemented format reward gating (line 233-243)
    - Rebalanced reward weights (line 108-116)

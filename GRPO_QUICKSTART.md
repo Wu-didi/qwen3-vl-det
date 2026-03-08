@@ -26,7 +26,7 @@ else:
 ### Basic Training
 
 ```bash
-python scripts/training/grpo_finetune_trl.py \
+python scripts/training/rft/grpo_finetune_trl.py \
     --model_path Qwen/Qwen3-VL-2B-Instruct \
     --train_data data/qwen_data/train.json \
     --val_data data/qwen_data/val.json \
@@ -58,7 +58,7 @@ export TEMPERATURE=0.7
 ### Continue from SFT Model
 
 ```bash
-python scripts/training/grpo_finetune_trl.py \
+python scripts/training/rft/grpo_finetune_trl.py \
     --model_path Qwen/Qwen3-VL-2B-Instruct \
     --sft_model_path outputs/qwen3vl_lora \
     --train_data data/qwen_data/train.json \
@@ -71,7 +71,7 @@ python scripts/training/grpo_finetune_trl.py \
 ### Basic Training
 
 ```bash
-python scripts/training/grpo_finetune.py \
+python scripts/training/rft/grpo_finetune.py \
     --model_path Qwen/Qwen3-VL-2B-Instruct \
     --train_data data/qwen_data/train.json \
     --val_data data/qwen_data/val.json \
@@ -265,7 +265,7 @@ chmod +x batch_infer.sh
 ./scripts/run/train_lora.sh
 
 # Step 2: GRPO on top of SFT
-python scripts/training/grpo_finetune_trl.py \
+python scripts/training/rft/grpo_finetune_trl.py \
     --sft_model_path outputs/qwen3vl_lora \
     --train_data data/qwen_data/train.json \
     --output_dir outputs/qwen3vl_grpo_from_sft
@@ -357,7 +357,7 @@ python scripts/data/cvat_to_qwenvl.py \
 ./scripts/run/train_lora.sh
 
 # 3. GRPO training
-python scripts/training/grpo_finetune_trl.py \
+python scripts/training/rft/grpo_finetune_trl.py \
     --model_path Qwen/Qwen3-VL-2B-Instruct \
     --sft_model_path outputs/qwen3vl_lora \
     --train_data data/qwen_data/train.json \

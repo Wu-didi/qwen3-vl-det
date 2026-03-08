@@ -71,7 +71,7 @@ echo "Num Generations: $NUM_GENERATIONS"
 echo "LoRA R: $LORA_R"
 echo "=========================================="
 
-CMD="python scripts/training/grpo_finetune.py \
+CMD="python scripts/training/rft/grpo_finetune.py \
     --model_path $MODEL_PATH \
     --train_data $TRAIN_DATA \
     --output_dir $OUTPUT_DIR \
