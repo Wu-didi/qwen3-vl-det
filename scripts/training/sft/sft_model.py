@@ -1,4 +1,5 @@
 import logging
+from importlib.metadata import PackageNotFoundError, version
 
 import torch
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
@@ -12,6 +13,23 @@ except ImportError:  # pragma: no cover
 
 
 logger = logging.getLogger(__name__)
+
+
+def ensure_bitsandbytes_available(config: FinetuneConfig) -> None:
+    """在启用 4bit/8bit 量化前检查 bitsandbytes 依赖。"""
+    if not (config.use_4bit or config.use_8bit):
+        return
+
+    try:
+        bnb_version = version("bitsandbytes")
+        logger.info("bitsandbytes version: %s", bnb_version)
+    except PackageNotFoundError as exc:
+        quant_mode = "4bit" if config.use_4bit else "8bit"
+        raise RuntimeError(
+            f"bitsandbytes is required for {quant_mode} quantization. "
+            "Install it with `python -m pip install bitsandbytes` "
+            "or disable 4bit with `--no_4bit`."
+        ) from exc
 
 
 def get_model_class(model_path: str):
@@ -30,6 +48,7 @@ def get_model_class(model_path: str):
 def create_model_and_processor(config: FinetuneConfig):
     """创建模型与处理器，并挂载 LoRA 适配器。"""
     logger.info("Loading model from %s", config.model_path)
+    ensure_bitsandbytes_available(config)
 
     # 1) 动态选择模型类，支持不同 Qwen-VL 版本。
     model_class = get_model_class(config.model_path)

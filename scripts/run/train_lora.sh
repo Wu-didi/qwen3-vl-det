@@ -6,9 +6,9 @@ set -e
 #==========================================
 # 常用参数 - 直接修改这里
 #==========================================
-CUDA_DEVICES=6                    # GPU 编号，多卡用 "0,1,2"
+CUDA_DEVICES=0                    # GPU 编号，多卡用 "0,1,2"
 MAX_IMAGE_SIZE=1024                # 图片最大边长 (256/384/512/768)
-BATCH_SIZE=2                      # 批次大小
+BATCH_SIZE=1                      # 批次大小
 GRADIENT_ACCUMULATION=8           # 梯度累积
 LORA_R=64                         # LoRA rank (8/16/32/64)
 NUM_EPOCHS=3                      # 训练轮数
@@ -17,10 +17,10 @@ LEARNING_RATE=2e-4                # 学习率
 #==========================================
 # 路径配置
 #==========================================
-MODEL_PATH="./model_cache/Qwen/Qwen3-VL-4B-Instruct"
-TRAIN_DATA="data/hefei_last_dataset/qwen_data/train.json"
-VAL_DATA="data/hefei_last_dataset/qwen_data/val.json"
-OUTPUT_DIR="outputs/qwen3vl_lora"
+MODEL_PATH="./model_cache/Qwen/Qwen3-VL-2B-Instruct"
+TRAIN_DATA="data/hefei_last_dataset/sft_output/train.jsonl"
+VAL_DATA="data/hefei_last_dataset/sft_output/val.jsonl"
+OUTPUT_DIR="outputs/qwen3vl2b_lora"
 
 #==========================================
 # 其他参数 (一般不需要改)
@@ -39,6 +39,14 @@ export LD_LIBRARY_PATH=/opt/conda/lib/python3.11/site-packages/nvidia/cuda_runti
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 cd "$(dirname "$0")/../.."
+
+# 自动检测 bitsandbytes，缺失时禁用 4bit，避免训练直接报错退出。
+if [ "$DISABLE_4BIT" != "true" ]; then
+    if ! python -c "from importlib.util import find_spec; raise SystemExit(0 if find_spec('bitsandbytes') else 1)"; then
+        echo "[WARN] bitsandbytes not found, switch to non-4bit mode (--no_4bit)."
+        DISABLE_4BIT=true
+    fi
+fi
 
 echo "=========================================="
 echo "LoRA/QLoRA 监督微调"

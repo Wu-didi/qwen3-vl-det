@@ -11,6 +11,85 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
+def load_grpo_dataset(
+    data_path: str,
+    processor,
+    max_image_size: int = 512,
+) -> Dataset:
+    """加载 GRPO 专用格式数据集（rft_output/*.jsonl）。
+
+    期望每行字段：image, prompt, ground_truth, difficulty
+    输出 dataset 字段：prompt, image_path, ground_truth, difficulty, max_image_size
+    ground_truth / difficulty 保留为 dict，由 collator 原样传入 reward 函数。
+    """
+    with open(data_path, "r", encoding="utf-8") as f:
+        first_char = f.read(1)
+        f.seek(0)
+        if first_char == "[":
+            raw_data = json.load(f)
+        else:
+            raw_data = [json.loads(line) for line in f if line.strip()]
+
+    logger.info("Loaded %d samples from %s", len(raw_data), data_path)
+
+    processed_data = []
+    skipped = 0
+
+    for idx, item in enumerate(raw_data):
+        image_path = item.get("image", "")
+        if not os.path.exists(image_path):
+            skipped += 1
+            continue
+
+        prompt_text = item.get("prompt", "")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }
+        ]
+        prompt = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        processed_data.append(
+            {
+                "prompt": prompt,
+                "image_path": image_path,
+                "ground_truth": item.get("ground_truth", {"detections": []}),
+                "difficulty": item.get("difficulty", {}),
+                "max_image_size": max_image_size,
+            }
+        )
+
+    logger.info("Processed %d samples, skipped %d", len(processed_data), skipped)
+    return Dataset.from_list(processed_data)
+
+
+def create_grpo_data_collator(processor):
+    """支持 GRPO 格式的 collator，将 ground_truth/difficulty 原样传入 batch。"""
+
+    def collate_fn(features):
+        images = []
+        for f in features:
+            img = load_image_lazy(f["image_path"], f.get("max_image_size", 512))
+            images.append([img])
+
+        return {
+            "prompt": [f["prompt"] for f in features],
+            "images": images,
+            "ground_truth": [f["ground_truth"] for f in features],
+            "difficulty": [f["difficulty"] for f in features],
+        }
+
+    return collate_fn
+
+
 def load_and_prepare_dataset(
     data_path: str,
     processor,

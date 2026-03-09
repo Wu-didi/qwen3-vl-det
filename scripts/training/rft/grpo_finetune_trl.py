@@ -18,7 +18,8 @@ from trl import GRPOConfig as TRLGRPOConfig
 
 # 兼容脚本运行与模块运行两种导入方式。
 try:
-    from data_utils import create_data_collator, load_and_prepare_dataset
+    from data_utils import create_data_collator, create_grpo_data_collator, load_and_prepare_dataset, load_grpo_dataset
+    from grpo_reward_functions import build_reward_funcs
     from model_utils import create_model_and_processor
     from qwen_grpo_trainer import QwenVLGRPOTrainer
     from rewarding import (
@@ -36,7 +37,8 @@ try:
         status_accuracy_reward,
     )
 except ImportError:  # pragma: no cover
-    from .data_utils import create_data_collator, load_and_prepare_dataset
+    from .data_utils import create_data_collator, create_grpo_data_collator, load_and_prepare_dataset, load_grpo_dataset
+    from .grpo_reward_functions import build_reward_funcs
     from .model_utils import create_model_and_processor
     from .qwen_grpo_trainer import QwenVLGRPOTrainer
     from .rewarding import (
@@ -118,9 +120,9 @@ def parse_args():
     parser.add_argument(
         "--reward_scheme",
         type=str,
-        default="risk_aware",
-        choices=["risk_aware", "legacy"],
-        help="Reward design: risk_aware (recommended) or legacy",
+        default="new_json",
+        choices=["new_json", "risk_aware", "legacy"],
+        help="Reward design: new_json (recommended, for rft_output data), risk_aware, or legacy",
     )
     parser.add_argument(
         "--reward_match_iou",
@@ -178,7 +180,12 @@ def parse_args():
 
 def build_reward_bundle(args):
     """根据 reward_scheme 构建奖励函数与权重。"""
-    if args.reward_scheme == "legacy":
+    if args.reward_scheme == "new_json":
+        # 使用 grpo_reward_functions.py 中的新版 JSON 格式 reward（配合 rft_output 数据）
+        reward_funcs = build_reward_funcs(as_list=True)
+        reward_weights = [0.2, 0.2, 0.6, 0.25, 0.25, 0.4, -0.05]
+        logger.info("Using NEW_JSON reward scheme (grpo_reward_functions.py)")
+    elif args.reward_scheme == "legacy":
         reward_funcs = [
             format_reward,
             bbox_iou_reward,
@@ -315,7 +322,12 @@ def main():
         lora_dropout=args.lora_dropout,
     )
 
-    dataset = load_and_prepare_dataset(
+    # 根据 reward_scheme 选择数据加载方式
+    use_grpo_format = args.reward_scheme == "new_json"
+    _load_dataset = load_grpo_dataset if use_grpo_format else load_and_prepare_dataset
+    _collator = create_grpo_data_collator if use_grpo_format else create_data_collator
+
+    dataset = _load_dataset(
         data_path=args.train_data,
         processor=processor,
         max_image_size=args.max_image_size,
@@ -324,7 +336,7 @@ def main():
     eval_dataset = None
     if args.val_data and os.path.exists(args.val_data):
         logger.info("Loading validation data from %s", args.val_data)
-        eval_dataset = load_and_prepare_dataset(
+        eval_dataset = _load_dataset(
             data_path=args.val_data,
             processor=processor,
             max_image_size=args.max_image_size,
@@ -374,7 +386,7 @@ def main():
         peft_config=peft_config,
     )
 
-    trainer.data_collator = create_data_collator(processor)
+    trainer.data_collator = _collator(processor)
 
     logger.info("Starting GRPO training with TRL...")
     trainer.train()

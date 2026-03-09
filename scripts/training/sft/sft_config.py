@@ -46,9 +46,9 @@ class FinetuneConfig:
     # ------------------------------------------------------------------
     # 数据参数
     # ------------------------------------------------------------------
-    # 训练/验证数据，要求是 Qwen-VL 对话格式 JSON。
-    train_data: str = "data/hefei_last_dataset/qwen_data/train.json"
-    val_data: str = "data/hefei_last_dataset/qwen_data/val.json"
+    # 训练/验证数据，支持 JSON array (.json) 或 JSON Lines (.jsonl) 格式。
+    train_data: str = "data/hefei_last_dataset/sft_output/train.jsonl"
+    val_data: str = "data/hefei_last_dataset/sft_output/val.jsonl"
     # 文本 token 最大长度，超出会截断。
     max_length: int = 2048
     # 图像最长边缩放上限，控制显存与视觉 token 数。

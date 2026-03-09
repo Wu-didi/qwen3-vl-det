@@ -234,6 +234,55 @@ class DetectionParser:
 
         return detections
 
+    @staticmethod
+    def parse_json_format(text: str) -> List[Detection]:
+        """解析新格式的 JSON 检测结果。
+
+        期望格式:
+          {"detections":[{"device_type":"...","sub_type":...,"state":"...","bbox_1000":[x1,y1,x2,y2]}]}
+
+        同时兼容模型输出中 JSON 被 markdown 代码块包裹的情况。
+        """
+        # 去除 markdown 代码块包裹
+        clean = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
+
+        # 尝试直接解析
+        payload = None
+        try:
+            payload = json.loads(clean)
+        except json.JSONDecodeError:
+            # 尝试从文本中提取第一个 {...} 块
+            match = re.search(r"\{.*\}", clean, re.DOTALL)
+            if match:
+                try:
+                    payload = json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+
+        if payload is None or "detections" not in payload:
+            return []
+
+        detections = []
+        for det in payload["detections"]:
+            try:
+                bbox = det.get("bbox_1000", [])
+                if len(bbox) != 4:
+                    continue
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                category = det.get("device_type", "unknown")
+                state = det.get("state", "normal")
+                is_anomaly = state != "normal"
+                detections.append(Detection(
+                    category=category,
+                    bbox=[x1, y1, x2, y2],
+                    confidence=1.0,
+                    status=state,
+                    is_anomaly=is_anomaly,
+                ))
+            except (ValueError, TypeError, KeyError):
+                continue
+        return detections
+
 
 def normalize_text(text: str) -> str:
     """Normalize text for VLM quality metrics."""
@@ -359,11 +408,33 @@ def compute_token_f1(pred_tokens: List[str], ref_tokens: List[str]) -> float:
 def is_no_object_response(text: str) -> bool:
     """Check whether text explicitly indicates no object/equipment."""
     text_lower = text.lower()
-    return any(pattern in text_lower for pattern in NO_OBJECT_PATTERNS)
+    if any(pattern in text_lower for pattern in NO_OBJECT_PATTERNS):
+        return True
+    # 新格式：{"detections": []}
+    try:
+        clean = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
+        payload = json.loads(clean)
+        if isinstance(payload, dict) and payload.get("detections") == []:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def is_strict_detection_format(text: str) -> bool:
-    """Check strict structured detection format."""
+    """Check strict structured detection format.
+
+    兼容新 JSON 格式和旧 <box> 格式。
+    """
+    # 新格式：合法 JSON 且含 detections 字段
+    try:
+        clean = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
+        payload = json.loads(clean)
+        if isinstance(payload, dict) and "detections" in payload:
+            return True
+    except Exception:
+        pass
+    # 旧格式：含 <box> + 编号 + 状态
     has_box = bool(re.search(BOX_PATTERN, text))
     has_numbered = bool(re.search(r"\d+\.\s+\S+", text))
     has_status = bool(re.search(r"状态[：:]\s*\S+", text))
@@ -788,6 +859,7 @@ class ModelInference:
     def __init__(
         self,
         model_path: str,
+        base_model_path: str = None,
         use_4bit: bool = True,
         bf16: bool = True,
         max_image_size: int = 512,
@@ -797,7 +869,21 @@ class ModelInference:
 
         logger.info(f"Loading model from {model_path}")
 
-        model_class = get_model_class(model_path)
+        # 检测是否是 LoRA adapter 目录
+        adapter_config_path = os.path.join(model_path, "adapter_config.json")
+        is_lora = os.path.exists(adapter_config_path)
+
+        if is_lora:
+            # 优先用外部传入的 base_model_path，其次读 adapter_config.json
+            if base_model_path is None:
+                with open(adapter_config_path) as f:
+                    adapter_cfg = json.load(f)
+                base_model_path = adapter_cfg.get("base_model_name_or_path", model_path)
+            logger.info(f"LoRA adapter detected, base model: {base_model_path}")
+        else:
+            base_model_path = model_path
+
+        model_class = get_model_class(base_model_path)
 
         # 量化配置
         bnb_config = None
@@ -809,18 +895,24 @@ class ModelInference:
                 bnb_4bit_use_double_quant=True,
             )
 
-        # 加载模型
+        # 加载基础模型
         self.model = model_class.from_pretrained(
-            model_path,
+            base_model_path,
             quantization_config=bnb_config,
             torch_dtype=torch.bfloat16 if bf16 else torch.float16,
             device_map="auto",
             trust_remote_code=True,
         )
 
-        # 加载处理器
+        # 如果是 LoRA，挂载 adapter
+        if is_lora:
+            from peft import PeftModel
+            self.model = PeftModel.from_pretrained(self.model, model_path)
+            logger.info("LoRA adapter loaded successfully")
+
+        # 加载处理器：LoRA checkpoint 目录里没有 tokenizer，从基础模型加载
         self.processor = AutoProcessor.from_pretrained(
-            model_path,
+            base_model_path,
             trust_remote_code=True,
         )
 
@@ -883,16 +975,20 @@ class ModelInference:
 
 
 def load_test_data(data_path: str) -> List[Dict]:
-    """加载测试数据"""
+    """加载测试数据，支持 JSON array 和 JSONL 两种格式"""
     with open(data_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+        first_char = f.read(1)
+        f.seek(0)
+        if first_char == '[':
+            data = json.load(f)
+        else:
+            data = [json.loads(line) for line in f if line.strip()]
     logger.info(f"Loaded {len(data)} test samples from {data_path}")
     return data
 
 
 def parse_ground_truth(conversations: List[Dict]) -> Tuple[str, List[Detection], str]:
     """从 conversations 中解析 prompt、ground truth detections 和 reference text"""
-    # 提取 user 和 assistant 消息
     user_msg = ""
     assistant_msg = ""
 
@@ -910,9 +1006,11 @@ def parse_ground_truth(conversations: List[Dict]) -> Tuple[str, List[Detection],
         elif role == "assistant":
             assistant_msg = text
 
-    # 解析 ground truth
+    # 优先尝试新 JSON 格式，回退到旧 <box> 格式
     parser = DetectionParser()
-    gt_dets = parser.parse_box_format(assistant_msg)
+    gt_dets = parser.parse_json_format(assistant_msg)
+    if not gt_dets:
+        gt_dets = parser.parse_box_format(assistant_msg)
 
     return user_msg, gt_dets, assistant_msg
 
@@ -924,6 +1022,7 @@ def run_evaluation(
     iou_thresholds: List[float] = None,
     use_4bit: bool = True,
     max_samples: Optional[int] = None,
+    base_model_path: str = None,
 ):
     """运行完整评估"""
     if iou_thresholds is None:
@@ -936,6 +1035,7 @@ def run_evaluation(
     # 加载模型
     inference = ModelInference(
         model_path=model_path,
+        base_model_path=base_model_path,
         use_4bit=use_4bit,
     )
 
@@ -962,7 +1062,9 @@ def run_evaluation(
         pred_text = inference.predict(image, prompt)
         latency = (time.time() - infer_start) * 1000.0
 
-        pred_dets = parser.parse_box_format(pred_text)
+        pred_dets = parser.parse_json_format(pred_text)
+        if not pred_dets and not is_no_object_response(pred_text):
+            pred_dets = parser.parse_box_format(pred_text)
 
         image_id = sample.get("id") or f"{Path(image_path).stem}_{idx}"
         samples_for_eval.append(
@@ -1209,7 +1311,13 @@ def main():
         "--model_path",
         type=str,
         required=True,
-        help="Path to model (base model or fine-tuned LoRA)"
+        help="Path to model (base model or fine-tuned LoRA adapter dir)"
+    )
+    parser.add_argument(
+        "--base_model_path",
+        type=str,
+        default=None,
+        help="Base model path, required when --model_path is a LoRA adapter dir and adapter_config.json has wrong base path"
     )
     parser.add_argument(
         "--no_4bit",
@@ -1276,6 +1384,7 @@ def main():
     # 运行评估
     run_evaluation(
         model_path=args.model_path,
+        base_model_path=args.base_model_path,
         test_data_path=args.test_data,
         output_dir=args.output_dir,
         iou_thresholds=iou_thresholds,

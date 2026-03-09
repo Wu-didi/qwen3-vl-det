@@ -38,9 +38,17 @@ class TrafficAnomalyDataset(Dataset):
         # 图像最长边限制，用于控制视觉 token 数量和显存。
         self.max_image_size = max_image_size
 
-        # 一次性加载 JSON 到内存，便于随机索引。
+        # 一次性加载数据到内存，便于随机索引。
+        # 同时支持 JSON array (.json) 和 JSON Lines (.jsonl) 两种格式。
         with open(data_path, "r", encoding="utf-8") as f:
-            self.data = json.load(f)
+            first_char = f.read(1)
+            f.seek(0)
+            if first_char == "[":
+                # JSON array 格式
+                self.data = json.load(f)
+            else:
+                # JSONL 格式：每行一个 JSON 对象
+                self.data = [json.loads(line) for line in f if line.strip()]
 
         logger.info("Loaded %d samples from %s", len(self.data), data_path)
 

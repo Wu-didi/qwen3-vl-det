@@ -19,10 +19,10 @@ LEARNING_RATE=5e-6                # 学习率 (降低，原 1e-5)
 # 路径配置
 #==========================================
 MODEL_PATH="./model_cache/Qwen/Qwen3-VL-2B-Instruct"
-SFT_MODEL_PATH="./outputs/qwen3vl_lora"   # SFT 微调后的模型路径 (留空则从基础模型开始)
-TRAIN_DATA="data/hefei_last_dataset/qwen_data/train.json"
-VAL_DATA="data/hefei_last_dataset/qwen_data/val.json"  # 验证集路径 (留空则不验证)
-OUTPUT_DIR="outputs/qwen3vl_grpo"
+SFT_MODEL_PATH="./outputs/qwen3vl2b_lora/checkpoint-2500"   # SFT 微调后的模型路径 (留空则从基础模型开始)
+TRAIN_DATA="data/hefei_last_dataset/rft_output/train.jsonl"
+VAL_DATA="data/hefei_last_dataset/rft_output/val.jsonl"  # 验证集路径 (留空则不验证)
+OUTPUT_DIR="outputs/qwen3vl_grpo_trl"
 
 #==========================================
 # GRPO 参数 (一般不需要改)
@@ -71,7 +71,7 @@ echo "Num Generations: $NUM_GENERATIONS"
 echo "LoRA R: $LORA_R"
 echo "=========================================="
 
-CMD="python scripts/training/rft/grpo_finetune.py \
+CMD="python scripts/training/rft/grpo_finetune_trl.py \
     --model_path $MODEL_PATH \
     --train_data $TRAIN_DATA \
     --output_dir $OUTPUT_DIR \
@@ -82,16 +82,14 @@ CMD="python scripts/training/rft/grpo_finetune.py \
     --lora_alpha $LORA_ALPHA \
     --lora_dropout $LORA_DROPOUT \
     --temperature $TEMPERATURE \
-    --kl_coef $KL_COEF \
+    --beta $KL_COEF \
     --num_epochs $NUM_EPOCHS \
     --gradient_accumulation_steps $GRADIENT_ACCUMULATION \
     --learning_rate $LEARNING_RATE \
-    --max_length $MAX_LENGTH \
     --save_steps $SAVE_STEPS \
     --eval_steps $EVAL_STEPS \
-    --usability_check_steps $USABILITY_CHECK_STEPS \
-    --usability_check_samples $USABILITY_CHECK_SAMPLES \
-    --logging_steps $LOGGING_STEPS"
+    --logging_steps $LOGGING_STEPS \
+    --reward_scheme new_json"
 
 if [ "$DISABLE_4BIT" = "true" ]; then
     CMD="$CMD --no_4bit"
