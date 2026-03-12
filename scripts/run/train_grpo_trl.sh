@@ -35,9 +35,11 @@ REWARD_OMISSION_PENALTY="${REWARD_OMISSION_PENALTY:-1.0}"
 REWARD_W_FORMAT="${REWARD_W_FORMAT:-0.2}"
 REWARD_W_SET_F1="${REWARD_W_SET_F1:-3.0}"
 REWARD_W_IOU="${REWARD_W_IOU:-2.0}"
-REWARD_W_COUNT="${REWARD_W_COUNT:-1.2}"
+REWARD_W_COUNT="${REWARD_W_COUNT:-1.5}"
 REWARD_W_RISK="${REWARD_W_RISK:-2.5}"
 REWARD_W_ANOMALY="${REWARD_W_ANOMALY:-2.0}"
+REWARD_W_RECALL="${REWARD_W_RECALL:-2.0}"
+REWARD_W_COMPLETENESS="${REWARD_W_COMPLETENESS:-1.5}"
 
 #==========================================
 # 路径配置
@@ -122,6 +124,8 @@ CMD="python scripts/training/rft/grpo_finetune_trl.py \
     --reward_w_count $REWARD_W_COUNT \
     --reward_w_risk $REWARD_W_RISK \
     --reward_w_anomaly $REWARD_W_ANOMALY \
+    --reward_w_recall $REWARD_W_RECALL \
+    --reward_w_completeness $REWARD_W_COMPLETENESS \
     --num_epochs $NUM_EPOCHS \
     --gradient_accumulation_steps $GRADIENT_ACCUMULATION \
     --learning_rate $LEARNING_RATE \

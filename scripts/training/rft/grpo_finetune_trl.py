@@ -27,10 +27,12 @@ try:
         anomaly_instance_f1_reward,
         bbox_iou_reward,
         category_match_reward,
+        completeness_reward,
         count_alignment_reward,
         format_reward,
         get_risk_reward_config,
         localization_quality_reward,
+        recall_reward,
         risk_control_reward,
         set_f1_reward,
         set_risk_reward_config,
@@ -46,10 +48,12 @@ except ImportError:  # pragma: no cover
         anomaly_instance_f1_reward,
         bbox_iou_reward,
         category_match_reward,
+        completeness_reward,
         count_alignment_reward,
         format_reward,
         get_risk_reward_config,
         localization_quality_reward,
+        recall_reward,
         risk_control_reward,
         set_f1_reward,
         set_risk_reward_config,
@@ -154,6 +158,8 @@ def parse_args():
     parser.add_argument("--reward_w_count", type=float, default=1.2)
     parser.add_argument("--reward_w_risk", type=float, default=2.5)
     parser.add_argument("--reward_w_anomaly", type=float, default=2.0)
+    parser.add_argument("--reward_w_recall", type=float, default=2.0)
+    parser.add_argument("--reward_w_completeness", type=float, default=1.5)
 
     # -------------------- 训练参数 --------------------
     parser.add_argument("--output_dir", type=str, default="outputs/qwen3vl_grpo_trl")
@@ -202,6 +208,8 @@ def build_reward_bundle(args):
             count_alignment_reward,
             risk_control_reward,
             anomaly_instance_f1_reward,
+            recall_reward,
+            completeness_reward,
         ]
         reward_weights = [
             args.reward_w_format,
@@ -210,6 +218,8 @@ def build_reward_bundle(args):
             args.reward_w_count,
             args.reward_w_risk,
             args.reward_w_anomaly,
+            args.reward_w_recall,
+            args.reward_w_completeness,
         ]
         cfg = get_risk_reward_config()
         logger.info("Using RISK-AWARE reward scheme")

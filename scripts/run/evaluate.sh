@@ -1,6 +1,6 @@
-export CUDA_VISIBLE_DEVICES=0
+# export CUDA_VISIBLE_DEVICES=0
 
-MODEL_PATH="outputs/qwen3vl2b_lora/checkpoint-2500"
+MODEL_PATH="/mnt/home/wudidi/code_v5/qwen3-vl-det/outputs/qwen3vl4b_lora"
 
 # 自动用模型路径生成输出目录，避免覆盖
 OUTPUT_DIR="eval_results/$(echo $MODEL_PATH | tr '/' '_')"

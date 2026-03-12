@@ -224,7 +224,9 @@ def set_f1_reward(completions: List[str], assistant: List[str], **kwargs) -> Lis
 
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        rewards.append(_safe_f1(precision, recall))
+        # 使用 F2 score (beta=2)，recall 权重是 precision 的 4 倍
+        # F_beta = (1+beta^2)*P*R / (beta^2*P + R)
+        rewards.append(_safe_fbeta(precision, recall, beta=2.0))
 
     return rewards
 
@@ -298,7 +300,14 @@ def count_alignment_reward(completions: List[str], assistant: List[str], **kwarg
             rewards.append(-min(1.0, RISK_REWARD_CFG.omission_penalty))
             continue
 
-        ratio_err = abs(pred_count - gt_count) / max(gt_count, 1)
+        # 非对称惩罚：漏检（pred < gt）惩罚 2x 于过检（pred > gt）
+        diff = pred_count - gt_count
+        if diff < 0:
+            # 漏检：惩罚力度加倍
+            ratio_err = abs(diff) / max(gt_count, 1) * 2.0
+        else:
+            # 过检：正常惩罚
+            ratio_err = diff / max(gt_count, 1)
         rewards.append(max(-1.0, min(1.0, 1.0 - ratio_err)))
 
     return rewards
@@ -602,3 +611,95 @@ def _safe_f1(precision: float, recall: float) -> float:
     if precision + recall == 0:
         return 0.0
     return 2 * precision * recall / (precision + recall)
+
+
+def _safe_fbeta(precision: float, recall: float, beta: float = 2.0) -> float:
+    """安全版 F-beta 计算。beta>1 偏向 recall，beta<1 偏向 precision。"""
+    if precision + recall == 0:
+        return 0.0
+    beta_sq = beta * beta
+    return (1 + beta_sq) * precision * recall / (beta_sq * precision + recall)
+
+
+def recall_reward(completions: List[str], assistant: List[str], **kwargs) -> List[float]:
+    """直接召回率奖励：匹配到的 GT 占比，强迫模型不漏检。"""
+    rewards: List[float] = []
+
+    for completion, gt_response in zip(completions, assistant):
+        if not _is_format_valid(completion, gt_response):
+            rewards.append(0.0)
+            continue
+
+        pred_dets = _extract_detections(completion)
+        gt_dets = _extract_detections(gt_response)
+        pred_count = len(pred_dets)
+        gt_count = len(gt_dets)
+
+        if gt_count == 0:
+            # 空场景：有预测框 = 幻觉，惩罚
+            if pred_count == 0 and _is_no_detection_response(completion):
+                rewards.append(1.0)
+            elif pred_count == 0:
+                rewards.append(max(0.0, 1.0 - RISK_REWARD_CFG.no_detection_missing_penalty))
+            else:
+                penalty = min(1.0, pred_count * RISK_REWARD_CFG.hallucination_unit_penalty)
+                rewards.append(-penalty)
+            continue
+
+        if pred_count == 0:
+            # GT 有目标但模型未输出任何框：严重漏检
+            rewards.append(-1.0)
+            continue
+
+        matches = _match_detections(
+            pred_dets,
+            gt_dets,
+            iou_threshold=RISK_REWARD_CFG.match_iou_threshold,
+            require_category=False,
+        )
+        recall = len(matches) / gt_count
+        rewards.append(recall)
+
+    return rewards
+
+
+def completeness_reward(completions: List[str], assistant: List[str], **kwargs) -> List[float]:
+    """响应完整性奖励：惩罚 GT 有多个目标但模型只输出极少框的偷懒行为。"""
+    rewards: List[float] = []
+
+    for completion, gt_response in zip(completions, assistant):
+        if not _is_format_valid(completion, gt_response):
+            rewards.append(0.0)
+            continue
+
+        pred_dets = _extract_detections(completion)
+        gt_dets = _extract_detections(gt_response)
+        pred_count = len(pred_dets)
+        gt_count = len(gt_dets)
+
+        if gt_count == 0:
+            # 空场景
+            if pred_count == 0:
+                rewards.append(1.0)
+            else:
+                rewards.append(0.0)
+            continue
+
+        if pred_count == 0:
+            rewards.append(-1.0)
+            continue
+
+        # 完整性 = min(pred/gt, 1.0)，不奖励过检
+        coverage = min(pred_count / gt_count, 1.0)
+
+        # 额外检查：输出 token 数过短时施加惩罚
+        # 正常检测每个框约需 30-50 tokens，极短输出说明模型在偷懒
+        completion_len = len(completion)
+        expected_min_len = gt_count * 20  # 每个 GT 框至少 20 字符
+        if completion_len < expected_min_len and pred_count < gt_count:
+            length_penalty = max(0.0, completion_len / expected_min_len)
+            coverage = coverage * length_penalty
+
+        rewards.append(max(-1.0, min(1.0, coverage * 2.0 - 1.0)))
+
+    return rewards
