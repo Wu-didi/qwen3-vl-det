@@ -7,8 +7,8 @@ set -e
 #==========================================
 # 常用参数 - 直接修改这里
 #==========================================
-CUDA_DEVICES=7                    # GPU 编号
-MAX_IMAGE_SIZE=512                 # 图片最大边长 (推荐 384-512，1024 太大会很慢！)
+CUDA_DEVICES=5                    # GPU 编号
+MAX_IMAGE_SIZE=512                # 图片最大边长 (推荐 384-512，1024 太大会很慢！)
 BATCH_SIZE=1                      # 批次大小
 NUM_GENERATIONS=4                 # 每样本生成数 (可改为 2 加速，但效果可能略差)
 GRADIENT_ACCUMULATION=4           # 梯度累积
@@ -43,10 +43,10 @@ REWARD_W_ANOMALY="${REWARD_W_ANOMALY:-2.0}"
 # 路径配置
 #==========================================
 MODEL_PATH="./model_cache/Qwen/Qwen3-VL-8B-Instruct"
-SFT_MODEL_PATH="/mnt/home/wudidi/code_v5/qwen3-vl-det/outputs/qwen3vl_lora_exp3"   # SFT 模型路径 (留空从基础模型开始)
+SFT_MODEL_PATH="/mnt/home/wudidi/code_v5/qwen3-vl-det/outputs/qwen3vl8b_lora"   # SFT 微调后的模型路径 (留空则从基础模型开始)
 TRAIN_DATA="data/hefei_last_dataset/qwen_data/train.json"
 VAL_DATA="data/hefei_last_dataset/qwen_data/val.json"  # 验证集路径 (留空则不验证)
-OUTPUT_DIR="outputs/qwen3vl_grpo_trl"
+OUTPUT_DIR="outputs/qwen3vl8b_grpo_trl"
 
 #==========================================
 # 其他参数

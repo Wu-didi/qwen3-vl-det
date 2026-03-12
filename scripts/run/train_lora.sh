@@ -6,9 +6,9 @@ set -e
 #==========================================
 # 常用参数 - 直接修改这里
 #==========================================
-CUDA_DEVICES=0                    # GPU 编号，多卡用 "0,1,2"
+CUDA_DEVICES=5                    # GPU 编号，多卡用 "0,1,2"
 MAX_IMAGE_SIZE=1024                # 图片最大边长 (256/384/512/768)
-BATCH_SIZE=1                      # 批次大小
+BATCH_SIZE=2                      # 批次大小
 GRADIENT_ACCUMULATION=8           # 梯度累积
 LORA_R=64                         # LoRA rank (8/16/32/64)
 NUM_EPOCHS=3                      # 训练轮数
@@ -17,10 +17,10 @@ LEARNING_RATE=2e-4                # 学习率
 #==========================================
 # 路径配置
 #==========================================
-MODEL_PATH="./model_cache/Qwen/Qwen3-VL-2B-Instruct"
+MODEL_PATH="./model_cache/Qwen/Qwen3-VL-8B-Instruct"
 TRAIN_DATA="data/hefei_last_dataset/sft_output/train.jsonl"
 VAL_DATA="data/hefei_last_dataset/sft_output/val.jsonl"
-OUTPUT_DIR="outputs/qwen3vl2b_lora"
+OUTPUT_DIR="outputs/qwen3vl8b_lora"
 
 #==========================================
 # 其他参数 (一般不需要改)

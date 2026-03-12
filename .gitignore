@@ -20,11 +20,11 @@ model_cache/
 *.gguf
 
 # Training outputs
-outputs/
+outputs
 checkpoints/
 runs/
 wandb/
-model_cache/
+model_cache
 
 # Data (keep structure, ignore large files)
 data/**/images/
