@@ -67,8 +67,6 @@ class QwenVLGRPOTrainer(GRPOTrainer):
             "padding": True,
             "padding_side": "left",
             "add_special_tokens": False,
-            "max_length": self.args.max_prompt_length,
-            "truncation": True,
         }
 
         if images is not None:
@@ -192,8 +190,6 @@ class QwenVLGRPOTrainer(GRPOTrainer):
                 text=prompts,
                 padding=True,
                 return_tensors="pt",
-                max_length=self.args.max_prompt_length,
-                truncation=True,
             )
             processor_kwargs["images"] = images
 

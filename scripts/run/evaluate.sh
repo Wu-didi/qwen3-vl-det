@@ -1,6 +1,6 @@
-# export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=6
 
-MODEL_PATH="/mnt/home/wudidi/code_v5/qwen3-vl-det/outputs/qwen3vl4b_lora"
+MODEL_PATH="/mnt/home/wudidi/code_v5/qwen3-vl-det/outputs/qwen3vl8b_grpo_trl_exp3/final"
 
 # 自动用模型路径生成输出目录，避免覆盖
 OUTPUT_DIR="eval_results/$(echo $MODEL_PATH | tr '/' '_')"
