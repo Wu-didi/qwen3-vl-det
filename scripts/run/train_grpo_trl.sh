@@ -49,6 +49,7 @@ SFT_MODEL_PATH="/mnt/home/wudidi/code_v5/qwen3-vl-det/outputs/qwen3vl8b_lora"   
 TRAIN_DATA="data/hefei_last_dataset/qwen_data/train.json"
 VAL_DATA="data/hefei_last_dataset/qwen_data/val.json"  # 验证集路径 (留空则不验证)
 OUTPUT_DIR="outputs/qwen3vl8b_grpo_trl_exp3"
+LOG_DIR=""   # 留空则自动推导为 logs/qwen3vl8b_grpo_trl_exp3
 
 #==========================================
 # 其他参数
@@ -90,6 +91,7 @@ else
     SFT_MODEL_PATH=""
 fi
 echo "输出: $OUTPUT_DIR"
+echo "日志: ${LOG_DIR:-logs/$(basename $OUTPUT_DIR)}"
 echo "------------------------------------------"
 echo "图片大小: ${MAX_IMAGE_SIZE}px"
 echo "Batch Size: $BATCH_SIZE"
@@ -156,10 +158,15 @@ if [ "$USE_WANDB" = "true" ]; then
     CMD="$CMD --use_wandb --wandb_project $WANDB_PROJECT"
 fi
 
+if [ -n "$LOG_DIR" ]; then
+    CMD="$CMD --log_dir $LOG_DIR"
+fi
+
+_effective_log_dir="${LOG_DIR:-logs/$(basename $OUTPUT_DIR)}"
 echo ""
 echo "训练完成后，可以使用以下命令查看训练曲线："
-echo "  tensorboard --logdir $OUTPUT_DIR"
+echo "  tensorboard --logdir ${_effective_log_dir}/runs"
 echo "  或"
-echo "  python scripts/visualize_training_log.py --log $OUTPUT_DIR/training_log.json --output $OUTPUT_DIR/plots"
+echo "  python scripts/visualize_training_log.py --log ${_effective_log_dir}/training_log.json --output ${_effective_log_dir}/plots"
 echo ""
 eval $CMD

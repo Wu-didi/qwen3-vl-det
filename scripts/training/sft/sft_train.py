@@ -28,11 +28,15 @@ def train(config: FinetuneConfig):
     # 1) 固定随机种子，提升可复现性。
     torch.manual_seed(config.seed)
 
-    # 2) 创建输出目录。
+    # 2) 创建输出目录，并推导日志目录。
     os.makedirs(config.output_dir, exist_ok=True)
+    effective_log_dir = config.log_dir if config.log_dir else os.path.join(
+        "logs", os.path.basename(config.output_dir)
+    )
+    os.makedirs(effective_log_dir, exist_ok=True)
 
-    # 3) 保存本次训练配置，便于回溯。
-    config_path = os.path.join(config.output_dir, "finetune_config.json")
+    # 3) 保存本次训练配置到日志目录，便于回溯。
+    config_path = os.path.join(effective_log_dir, "finetune_config.json")
     with open(config_path, "w") as f:
         json.dump(vars(config), f, indent=2, default=str)
 
@@ -138,8 +142,8 @@ def train(config: FinetuneConfig):
     if hasattr(trainer.state, "best_model_checkpoint"):
         training_log["final_metrics"]["best_checkpoint"] = trainer.state.best_model_checkpoint
 
-    # 15) 写入 training_log.json。
-    log_path = os.path.join(config.output_dir, "training_log.json")
+    # 15) 写入 training_log.json 到日志目录。
+    log_path = os.path.join(effective_log_dir, "training_log.json")
     with open(log_path, "w") as f:
         json.dump(training_log, f, indent=2, default=str)
     logger.info("Training log saved to %s", log_path)

@@ -57,8 +57,11 @@ class FinetuneConfig:
     # ------------------------------------------------------------------
     # 训练参数
     # ------------------------------------------------------------------
-    # 输出目录（checkpoint、配置、训练日志）。
+    # 输出目录（checkpoint、模型权重）。
     output_dir: str = "outputs/qwen3vl_lora"
+    # 日志目录（training_log.json、finetune_config.json）。
+    # 留空时自动推导为 logs/<output_dir 的最后一级目录名>。
+    log_dir: str = ""
     num_epochs: int = 3
     batch_size: int = 1
     gradient_accumulation_steps: int = 8

@@ -54,7 +54,7 @@ data/dpo_data/
 
 # Logs
 *.log
-logs/
+# logs/
 
 # Test outputs
 .pytest_cache/

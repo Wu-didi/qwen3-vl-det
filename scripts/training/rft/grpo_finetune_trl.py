@@ -163,6 +163,13 @@ def parse_args():
 
     # -------------------- 训练参数 --------------------
     parser.add_argument("--output_dir", type=str, default="outputs/qwen3vl_grpo_trl")
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        default="",
+        help="Directory for training logs (training_log.json, training_config.json, TensorBoard). "
+             "Defaults to logs/<output_dir_basename> if not specified.",
+    )
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
@@ -255,7 +262,7 @@ def build_report_to(args):
     return ["tensorboard"]
 
 
-def save_training_log(trainer, args):
+def save_training_log(trainer, args, log_dir):
     """从 trainer.state 中提取并保存训练日志。"""
     training_log = {
         "config": vars(args),
@@ -293,7 +300,7 @@ def save_training_log(trainer, args):
     if hasattr(trainer.state, "best_model_checkpoint"):
         training_log["final_metrics"]["best_checkpoint"] = trainer.state.best_model_checkpoint
 
-    log_path = os.path.join(args.output_dir, "training_log.json")
+    log_path = os.path.join(log_dir, "training_log.json")
     with open(log_path, "w") as f:
         json.dump(training_log, f, indent=2, default=str)
     logger.info("Training log saved to %s", log_path)
@@ -319,7 +326,11 @@ def main():
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
-    with open(os.path.join(args.output_dir, "training_config.json"), "w") as f:
+    effective_log_dir = args.log_dir if args.log_dir else os.path.join(
+        "logs", os.path.basename(args.output_dir)
+    )
+    os.makedirs(effective_log_dir, exist_ok=True)
+    with open(os.path.join(effective_log_dir, "training_config.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
 
     model, processor, peft_config = create_model_and_processor(
@@ -360,6 +371,7 @@ def main():
     logger.info("Configuring GRPO training...")
     training_args = TRLGRPOConfig(
         output_dir=args.output_dir,
+        logging_dir=os.path.join(effective_log_dir, "runs"),
         run_name=args.run_name,
         num_train_epochs=args.num_epochs,
         per_device_train_batch_size=args.batch_size,
@@ -405,7 +417,7 @@ def main():
     trainer.save_model(final_dir)
     processor.save_pretrained(final_dir)
 
-    save_training_log(trainer, args)
+    save_training_log(trainer, args, effective_log_dir)
     logger.info("Training complete! Model saved to %s", final_dir)
 
 

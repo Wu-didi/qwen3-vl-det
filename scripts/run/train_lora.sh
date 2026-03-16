@@ -21,6 +21,7 @@ MODEL_PATH="./model_cache/Qwen/Qwen3-VL-8B-Instruct"
 TRAIN_DATA="data/hefei_last_dataset/sft_output/train.jsonl"
 VAL_DATA="data/hefei_last_dataset/sft_output/val.jsonl"
 OUTPUT_DIR="outputs/qwen3vl8b_lora"
+LOG_DIR=""   # 留空则自动推导为 logs/qwen3vl8b_lora
 
 #==========================================
 # 其他参数 (一般不需要改)
@@ -54,6 +55,7 @@ echo "=========================================="
 echo "GPU: $CUDA_DEVICES"
 echo "模型: $MODEL_PATH"
 echo "输出: $OUTPUT_DIR"
+echo "日志: ${LOG_DIR:-logs/$(basename $OUTPUT_DIR)}"
 echo "------------------------------------------"
 echo "图片大小: ${MAX_IMAGE_SIZE}px"
 echo "Batch Size: $BATCH_SIZE"
@@ -78,6 +80,10 @@ CMD="python scripts/training/sft/finetune_qwen_vl.py \
     --learning_rate $LEARNING_RATE \
     --max_length $MAX_LENGTH \
     --save_steps $SAVE_STEPS"
+
+if [ -n "$LOG_DIR" ]; then
+    CMD="$CMD --log_dir $LOG_DIR"
+fi
 
 if [ "$DISABLE_4BIT" = "true" ]; then
     CMD="$CMD --no_4bit"

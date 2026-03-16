@@ -120,7 +120,14 @@ def parse_args():
         "--output_dir",
         type=str,
         default="outputs/qwen3vl_lora",
-        help="Output directory",
+        help="Output directory for model weights and checkpoints",
+    )
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        default="",
+        help="Directory for training logs (training_log.json, finetune_config.json). "
+             "Defaults to logs/<output_dir_basename> if not specified.",
     )
     parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size per device")
@@ -187,6 +194,7 @@ def build_config(args) -> FinetuneConfig:
         max_length=args.max_length,
         max_image_size=args.max_image_size,
         output_dir=args.output_dir,
+        log_dir=args.log_dir,
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
