@@ -68,6 +68,34 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def infer_data_format(data_path: str) -> str:
+    """根据首条样本字段自动判断数据格式。"""
+    with open(data_path, "r", encoding="utf-8") as f:
+        first_char = f.read(1)
+        f.seek(0)
+        if first_char == "[":
+            raw_data = json.load(f)
+            first_item = raw_data[0] if raw_data else {}
+        else:
+            first_item = {}
+            for line in f:
+                if not line.strip():
+                    continue
+                first_item = json.loads(line)
+                break
+
+    if not isinstance(first_item, dict):
+        raise ValueError(f"Unsupported sample format in {data_path}")
+    if "ground_truth" in first_item:
+        return "grpo"
+    if "conversations" in first_item:
+        return "conversation"
+    raise ValueError(
+        f"Failed to infer data format from {data_path}: expected either 'ground_truth' "
+        "or 'conversations' field."
+    )
+
+
 def parse_args():
     """解析命令行参数。"""
     import argparse
@@ -115,6 +143,13 @@ def parse_args():
     # -------------------- 数据参数 --------------------
     parser.add_argument("--train_data", type=str, required=True)
     parser.add_argument("--val_data", type=str, default="", help="Path to validation data (optional)")
+    parser.add_argument(
+        "--data_format",
+        type=str,
+        default="auto",
+        choices=["auto", "conversation", "grpo"],
+        help="Training data format. 'auto' infers from sample fields.",
+    )
     parser.add_argument("--max_image_size", type=int, default=512)
 
     # -------------------- GRPO 参数 --------------------
@@ -343,8 +378,17 @@ def main():
         lora_dropout=args.lora_dropout,
     )
 
-    # 根据 reward_scheme 选择数据加载方式
-    use_grpo_format = args.reward_scheme == "new_json"
+    selected_data_format = infer_data_format(args.train_data) if args.data_format == "auto" else args.data_format
+    logger.info("Using data format: %s", selected_data_format)
+
+    if args.reward_scheme == "new_json" and selected_data_format != "grpo":
+        raise ValueError(
+            "reward_scheme=new_json requires GRPO-format data with ground_truth/difficulty fields. "
+            f"Detected data_format={selected_data_format}."
+        )
+
+    # 数据格式与 reward_scheme 解耦，避免把错误格式喂给奖励函数。
+    use_grpo_format = selected_data_format == "grpo"
     _load_dataset = load_grpo_dataset if use_grpo_format else load_and_prepare_dataset
     _collator = create_grpo_data_collator if use_grpo_format else create_data_collator
 

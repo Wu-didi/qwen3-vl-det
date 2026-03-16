@@ -124,6 +124,7 @@ pip install -r requirements_finetune.txt
 ```
 
 默认启用 `risk_aware` 奖励（实例级一对一匹配 + 漏检/误检风险惩罚 + 异常识别奖励）。
+脚本现在会默认优先使用 `data/hefei_last_dataset/rft_output/*.jsonl`，并启用 `DATA_FORMAT=auto` 自动识别数据格式。
 
 可用于消融对比：
 
@@ -137,6 +138,15 @@ REWARD_MATCH_IOU=0.5 \
 REWARD_W_SET_F1=3.0 \
 REWARD_W_RISK=2.5 \
 REWARD_W_ANOMALY=2.0 \
+./scripts/run/train_grpo_trl.sh
+```
+
+如果你手里是结构化 GRPO 数据，建议显式写出：
+
+```bash
+DATA_FORMAT=auto \
+TRAIN_DATA=data/hefei_last_dataset/rft_output/train.jsonl \
+VAL_DATA=data/hefei_last_dataset/rft_output/val.jsonl \
 ./scripts/run/train_grpo_trl.sh
 ```
 

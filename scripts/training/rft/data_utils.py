@@ -3,12 +3,37 @@
 import json
 import logging
 import os
+import re
 
 from datasets import Dataset
 from PIL import Image
 
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_assistant_ground_truth(text: str):
+    """尽量从 assistant 文本中解析 JSON ground truth。"""
+    if not text:
+        return None
+
+    clean = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
+    try:
+        payload = json.loads(clean)
+        if isinstance(payload, dict) and "detections" in payload:
+            return payload
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", clean, re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        payload = json.loads(match.group())
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) and "detections" in payload else None
 
 
 def load_grpo_dataset(
@@ -97,7 +122,12 @@ def load_and_prepare_dataset(
 ) -> Dataset:
     """加载并整理 GRPO 数据集（图像懒加载模式）。"""
     with open(data_path, "r", encoding="utf-8") as f:
-        raw_data = json.load(f)
+        first_char = f.read(1)
+        f.seek(0)
+        if first_char == "[":
+            raw_data = json.load(f)
+        else:
+            raw_data = [json.loads(line) for line in f if line.strip()]
 
     logger.info("Loaded %d samples from %s", len(raw_data), data_path)
 
@@ -162,6 +192,7 @@ def load_and_prepare_dataset(
                 "prompt": prompt,
                 "image_path": image_path,
                 "assistant": assistant_msg,
+                "ground_truth": _extract_assistant_ground_truth(assistant_msg),
                 "max_image_size": max_image_size,
             }
         )
@@ -205,6 +236,7 @@ def create_data_collator(processor):
             "prompt": [f["prompt"] for f in features],
             "images": images,
             "assistant": [f["assistant"] for f in features],
+            "ground_truth": [f.get("ground_truth") for f in features],
         }
 
     return collate_fn

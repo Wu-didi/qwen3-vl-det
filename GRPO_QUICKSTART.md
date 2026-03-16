@@ -28,8 +28,9 @@ else:
 ```bash
 python scripts/training/rft/grpo_finetune_trl.py \
     --model_path Qwen/Qwen3-VL-2B-Instruct \
-    --train_data data/qwen_data/train.json \
-    --val_data data/qwen_data/val.json \
+    --train_data data/hefei_last_dataset/rft_output/train.jsonl \
+    --val_data data/hefei_last_dataset/rft_output/val.jsonl \
+    --data_format auto \
     --output_dir outputs/qwen3vl_grpo \
     --num_generations 4 \
     --temperature 0.7 \
@@ -46,13 +47,14 @@ python scripts/training/rft/grpo_finetune_trl.py \
 ```bash
 # Set environment variables
 export MODEL_PATH="Qwen/Qwen3-VL-2B-Instruct"
-export TRAIN_DATA="data/qwen_data/train.json"
-export VAL_DATA="data/qwen_data/val.json"
+export TRAIN_DATA="data/hefei_last_dataset/rft_output/train.jsonl"
+export VAL_DATA="data/hefei_last_dataset/rft_output/val.jsonl"
+export DATA_FORMAT="auto"
 export NUM_GENERATIONS=4
 export TEMPERATURE=0.7
 
 # Run training
-./scripts/run/train_grpo.sh
+./scripts/run/train_grpo_trl.sh
 ```
 
 ### Continue from SFT Model
@@ -61,7 +63,8 @@ export TEMPERATURE=0.7
 python scripts/training/rft/grpo_finetune_trl.py \
     --model_path Qwen/Qwen3-VL-2B-Instruct \
     --sft_model_path outputs/qwen3vl_lora \
-    --train_data data/qwen_data/train.json \
+    --train_data data/hefei_last_dataset/rft_output/train.jsonl \
+    --data_format auto \
     --output_dir outputs/qwen3vl_grpo_from_sft \
     --num_generations 4
 ```

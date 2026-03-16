@@ -25,7 +25,7 @@ BETA=0.5                          # KL 惩罚系数 (防止模型偏离太远)
                                   # 0.5: 中度约束，推荐起始值
                                   # 1.0: 强约束，保守更新
 
-# 奖励函数方案: risk_aware(推荐, 可写论文) | legacy(旧版)
+# 奖励函数方案: risk_aware(兼容旧/新格式) | new_json(结构化 JSON 专用) | legacy(旧版)
 REWARD_SCHEME="${REWARD_SCHEME:-risk_aware}"
 REWARD_MATCH_IOU="${REWARD_MATCH_IOU:-0.5}"
 REWARD_HALLUCINATION_UNIT_PENALTY="${REWARD_HALLUCINATION_UNIT_PENALTY:-0.35}"
@@ -46,8 +46,17 @@ REWARD_W_COMPLETENESS="${REWARD_W_COMPLETENESS:-1.5}"
 #==========================================
 MODEL_PATH="./model_cache/Qwen/Qwen3-VL-8B-Instruct"
 SFT_MODEL_PATH="/mnt/home/wudidi/code_v5/qwen3-vl-det/outputs/qwen3vl8b_lora"   # SFT 微调后的模型路径 (留空则从基础模型开始)
-TRAIN_DATA="data/hefei_last_dataset/qwen_data/train.json"
-VAL_DATA="data/hefei_last_dataset/qwen_data/val.json"  # 验证集路径 (留空则不验证)
+DEFAULT_TRAIN_DATA="data/hefei_last_dataset/rft_output/train.jsonl"
+DEFAULT_VAL_DATA="data/hefei_last_dataset/rft_output/val.jsonl"
+if [ ! -f "$DEFAULT_TRAIN_DATA" ]; then
+    DEFAULT_TRAIN_DATA="data/hefei_last_dataset/qwen_data/train.json"
+fi
+if [ ! -f "$DEFAULT_VAL_DATA" ]; then
+    DEFAULT_VAL_DATA="data/hefei_last_dataset/qwen_data/val.json"
+fi
+TRAIN_DATA="${TRAIN_DATA:-$DEFAULT_TRAIN_DATA}"
+VAL_DATA="${VAL_DATA:-$DEFAULT_VAL_DATA}"  # 验证集路径 (留空则不验证)
+DATA_FORMAT="${DATA_FORMAT:-auto}"
 OUTPUT_DIR="outputs/qwen3vl8b_grpo_trl_exp3"
 LOG_DIR=""   # 留空则自动推导为 logs/qwen3vl8b_grpo_trl_exp3
 
@@ -101,11 +110,13 @@ echo "Learning Rate: $LEARNING_RATE"
 echo "Beta (KL coef): $BETA"
 echo "LoRA R: $LORA_R"
 echo "Reward scheme: $REWARD_SCHEME"
+echo "Data format: $DATA_FORMAT"
 echo "=========================================="
 
 CMD="python scripts/training/rft/grpo_finetune_trl.py \
     --model_path $MODEL_PATH \
     --train_data $TRAIN_DATA \
+    --data_format $DATA_FORMAT \
     --output_dir $OUTPUT_DIR \
     --max_image_size $MAX_IMAGE_SIZE \
     --batch_size $BATCH_SIZE \
