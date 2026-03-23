@@ -19,8 +19,8 @@ from trl import GRPOConfig as TRLGRPOConfig
 # 兼容脚本运行与模块运行两种导入方式。
 try:
     from data_utils import create_data_collator, create_grpo_data_collator, load_and_prepare_dataset, load_grpo_dataset
-    from grpo_reward_functions import build_reward_funcs
-    from model_utils import create_model_and_processor
+    from grpo_reward_functions import build_reward_funcs, build_simple_reward_funcs, build_v2_reward_funcs
+    from model_utils import create_model_and_processor, create_reference_model
     from qwen_grpo_trainer import QwenVLGRPOTrainer
     from rewarding import (
         RiskRewardConfig,
@@ -40,8 +40,8 @@ try:
     )
 except ImportError:  # pragma: no cover
     from .data_utils import create_data_collator, create_grpo_data_collator, load_and_prepare_dataset, load_grpo_dataset
-    from .grpo_reward_functions import build_reward_funcs
-    from .model_utils import create_model_and_processor
+    from .grpo_reward_functions import build_reward_funcs, build_simple_reward_funcs, build_v2_reward_funcs
+    from .model_utils import create_model_and_processor, create_reference_model
     from .qwen_grpo_trainer import QwenVLGRPOTrainer
     from .rewarding import (
         RiskRewardConfig,
@@ -155,13 +155,32 @@ def parse_args():
     # -------------------- GRPO 参数 --------------------
     parser.add_argument("--num_generations", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--beta", type=float, default=0.1, help="KL penalty coefficient")
+    parser.add_argument("--beta", type=float, default=0.0, help="KL penalty coefficient")
+    parser.add_argument(
+        "--ref_model_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "none", "base", "sft"],
+        help="Reference model for KL. auto => sft if beta>0 and sft_model_path exists, else base/none.",
+    )
+    parser.add_argument(
+        "--ref_use_4bit",
+        action="store_true",
+        help="Load the explicit KL reference model in 4-bit (default: enabled, use --no_ref_4bit to disable)",
+    )
+    parser.add_argument(
+        "--no_ref_4bit",
+        dest="ref_use_4bit",
+        action="store_false",
+        help="Disable 4-bit loading for the explicit KL reference model",
+    )
+    parser.set_defaults(ref_use_4bit=True)
     parser.add_argument(
         "--reward_scheme",
         type=str,
-        default="new_json",
-        choices=["new_json", "risk_aware", "legacy"],
-        help="Reward design: new_json (recommended, for rft_output data), risk_aware, or legacy",
+        default="simple",
+        choices=["simple", "new_json", "risk_aware", "legacy", "v2"],
+        help="Reward design: simple (recommended), v2, new_json, risk_aware, or legacy",
     )
     parser.add_argument(
         "--reward_match_iou",
@@ -203,7 +222,7 @@ def parse_args():
         type=str,
         default="",
         help="Directory for training logs (training_log.json, training_config.json, TensorBoard). "
-             "Defaults to logs/<output_dir_basename> if not specified.",
+        "Defaults to logs/<output_dir_basename> if not specified.",
     )
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -228,7 +247,15 @@ def parse_args():
 
 def build_reward_bundle(args):
     """根据 reward_scheme 构建奖励函数与权重。"""
-    if args.reward_scheme == "new_json":
+    if args.reward_scheme == "simple":
+        reward_funcs, reward_weights = build_simple_reward_funcs()
+        logger.info("Using SIMPLE reward scheme (format + detection@0.5 + state + category recall)")
+        logger.info("Simple reward weights: %s", reward_weights)
+    elif args.reward_scheme == "v2":
+        reward_funcs, reward_weights = build_v2_reward_funcs()
+        logger.info("Using V2 reward scheme (4 orthogonal functions, [0,1] range)")
+        logger.info("V2 reward weights: %s", reward_weights)
+    elif args.reward_scheme == "new_json":
         # 使用 grpo_reward_functions.py 中的新版 JSON 格式 reward（配合 rft_output 数据）
         reward_funcs = build_reward_funcs(as_list=True)
         reward_weights = [0.2, 0.2, 0.6, 0.25, 0.25, 0.4, -0.05]
@@ -276,6 +303,17 @@ def build_reward_bundle(args):
         logger.info("Risk-aware reward weights: %s", reward_weights)
 
     return reward_funcs, reward_weights
+
+
+def resolve_ref_model_mode(args) -> str:
+    """Pick a safe KL reference mode from the command-line options."""
+    if args.beta <= 0.0:
+        return "none"
+    if args.ref_model_mode != "auto":
+        return args.ref_model_mode
+    if args.sft_model_path and os.path.exists(args.sft_model_path):
+        return "sft"
+    return "base"
 
 
 def build_report_to(args):
@@ -377,13 +415,22 @@ def main():
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
     )
+    ref_model_mode = resolve_ref_model_mode(args)
+    ref_model = create_reference_model(
+        model_path=args.model_path,
+        ref_model_mode=ref_model_mode,
+        sft_model_path=args.sft_model_path,
+        use_4bit=args.ref_use_4bit,
+        bf16=args.bf16,
+    )
+    logger.info("Resolved KL reference mode: %s", ref_model_mode)
 
     selected_data_format = infer_data_format(args.train_data) if args.data_format == "auto" else args.data_format
     logger.info("Using data format: %s", selected_data_format)
 
-    if args.reward_scheme == "new_json" and selected_data_format != "grpo":
+    if args.reward_scheme in ("simple", "new_json", "v2") and selected_data_format != "grpo":
         raise ValueError(
-            "reward_scheme=new_json requires GRPO-format data with ground_truth/difficulty fields. "
+            "reward_scheme=simple/new_json/v2 requires GRPO-format data with ground_truth/difficulty fields. "
             f"Detected data_format={selected_data_format}."
         )
 
@@ -444,6 +491,7 @@ def main():
     logger.info("Creating trainer...")
     trainer = QwenVLGRPOTrainer(
         model=model,
+        ref_model=ref_model,
         reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=dataset,

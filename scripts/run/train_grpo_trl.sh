@@ -7,58 +7,48 @@ set -e
 #==========================================
 # 常用参数 - 直接修改这里
 #==========================================
-CUDA_DEVICES=7                    # GPU 编号
-MAX_IMAGE_SIZE=1024               # 图片最大边长 (必须与 SFT LoRA 阶段一致！)
-BATCH_SIZE=1                      # 批次大小
-NUM_GENERATIONS=4                 # 每样本生成数 (可改为 2 加速，但效果可能略差)
-GRADIENT_ACCUMULATION=4           # 梯度累积
-LORA_R=64                         # LoRA rank (可改为 32 加速)
-NUM_EPOCHS=1                      # 训练轮数
-LEARNING_RATE=5e-6                # 学习率 (GRPO 建议较低)
+CUDA_DEVICES=6
+MAX_IMAGE_SIZE=1024
+BATCH_SIZE=2
+NUM_GENERATIONS=4
+GRADIENT_ACCUMULATION=4
+LORA_R=64
+NUM_EPOCHS=1
+LEARNING_RATE=5e-6
 
 #==========================================
 # GRPO 参数 (关键参数)
 #==========================================
-TEMPERATURE=0.7                   # 生成温度
-BETA=0.5                          # KL 惩罚系数 (防止模型偏离太远)
-                                  # 0.1: 轻度约束，允许较大变化
-                                  # 0.5: 中度约束，推荐起始值
-                                  # 1.0: 强约束，保守更新
+TEMPERATURE=0.7
+BETA=0.0                   # 关键改动: 先关 KL，避免往 base model 拉回去
+REF_MODEL_MODE="auto"
+REF_USE_4BIT=true
 
-# 奖励函数方案: risk_aware(兼容旧/新格式) | new_json(结构化 JSON 专用) | legacy(旧版)
-REWARD_SCHEME="${REWARD_SCHEME:-risk_aware}"
-REWARD_MATCH_IOU="${REWARD_MATCH_IOU:-0.5}"
-REWARD_HALLUCINATION_UNIT_PENALTY="${REWARD_HALLUCINATION_UNIT_PENALTY:-0.35}"
-REWARD_NO_DET_MISSING_PENALTY="${REWARD_NO_DET_MISSING_PENALTY:-0.2}"
-REWARD_OMISSION_PENALTY="${REWARD_OMISSION_PENALTY:-1.0}"
-# 风险感知奖励权重 (仅 REWARD_SCHEME=risk_aware 生效)
-REWARD_W_FORMAT="${REWARD_W_FORMAT:-0.2}"
-REWARD_W_SET_F1="${REWARD_W_SET_F1:-3.0}"
-REWARD_W_IOU="${REWARD_W_IOU:-2.0}"
-REWARD_W_COUNT="${REWARD_W_COUNT:-1.5}"
-REWARD_W_RISK="${REWARD_W_RISK:-2.5}"
-REWARD_W_ANOMALY="${REWARD_W_ANOMALY:-2.0}"
-REWARD_W_RECALL="${REWARD_W_RECALL:-2.0}"
-REWARD_W_COMPLETENESS="${REWARD_W_COMPLETENESS:-1.5}"
+# 关键改动: 改成更贴近 AP50 的简单奖励
+REWARD_SCHEME="simple"
+REWARD_MATCH_IOU=0.5
+REWARD_HALLUCINATION_UNIT_PENALTY=0.35
+REWARD_NO_DET_MISSING_PENALTY=0.2
+REWARD_OMISSION_PENALTY=1.0
+REWARD_W_FORMAT=0.2
+REWARD_W_SET_F1=3.0
+REWARD_W_IOU=2.0
+REWARD_W_COUNT=1.5
+REWARD_W_RISK=2.5
+REWARD_W_ANOMALY=2.0
+REWARD_W_RECALL=2.0
+REWARD_W_COMPLETENESS=1.5
 
 #==========================================
 # 路径配置
 #==========================================
-MODEL_PATH="./model_cache/Qwen/Qwen3-VL-8B-Instruct"
-SFT_MODEL_PATH="/mnt/home/wudidi/code_v5/qwen3-vl-det/outputs/qwen3vl8b_lora"   # SFT 微调后的模型路径 (留空则从基础模型开始)
-DEFAULT_TRAIN_DATA="data/hefei_last_dataset/rft_output/train.jsonl"
-DEFAULT_VAL_DATA="data/hefei_last_dataset/rft_output/val.jsonl"
-if [ ! -f "$DEFAULT_TRAIN_DATA" ]; then
-    DEFAULT_TRAIN_DATA="data/hefei_last_dataset/qwen_data/train.json"
-fi
-if [ ! -f "$DEFAULT_VAL_DATA" ]; then
-    DEFAULT_VAL_DATA="data/hefei_last_dataset/qwen_data/val.json"
-fi
-TRAIN_DATA="${TRAIN_DATA:-$DEFAULT_TRAIN_DATA}"
-VAL_DATA="${VAL_DATA:-$DEFAULT_VAL_DATA}"  # 验证集路径 (留空则不验证)
-DATA_FORMAT="${DATA_FORMAT:-auto}"
-OUTPUT_DIR="outputs/qwen3vl8b_grpo_trl_exp3"
-LOG_DIR=""   # 留空则自动推导为 logs/qwen3vl8b_grpo_trl_exp3
+MODEL_PATH="./model_cache/Qwen/Qwen3-VL-4B-Instruct"
+SFT_MODEL_PATH="outputs/qwen3vl4b_lora"
+OUTPUT_DIR="outputs/qwen3vl4b_grpo_trl_exp6"
+LOG_DIR=""
+DATA_FORMAT="auto"
+TRAIN_DATA="data/hefei_last_dataset/rft_output_aligned/train.jsonl"
+VAL_DATA="data/hefei_last_dataset/rft_output_aligned/val.jsonl"
 
 #==========================================
 # 其他参数
@@ -68,16 +58,16 @@ LORA_DROPOUT=0.1
 MAX_COMPLETION_LENGTH=512
 MAX_PROMPT_LENGTH=1024
 SAVE_STEPS=200
-EVAL_STEPS=0                       # 每多少步验证一次 (设为 0 禁用验证以加速训练)
+EVAL_STEPS=0
 LOGGING_STEPS=10
 
 # 量化和精度选项
-DISABLE_4BIT=true                 # GRPO 阶段建议关闭 4bit，RL 梯度对量化误差更敏感
-DISABLE_BF16=false                # 设为 true 关闭 bf16 (默认开启)
+DISABLE_4BIT=true
+DISABLE_BF16=false
 
 # 日志选项
-USE_WANDB=false                   # 是否使用 wandb (需要 pip install wandb)
-WANDB_PROJECT="qwen-vl-grpo"      # wandb 项目名
+USE_WANDB=false
+WANDB_PROJECT="qwen-vl-grpo"
 
 #==========================================
 # 环境设置
@@ -99,8 +89,10 @@ else
     echo "SFT模型: 无 (从基础模型开始)"
     SFT_MODEL_PATH=""
 fi
+echo "训练数据: ${TRAIN_DATA:-<missing>}"
+echo "验证数据: ${VAL_DATA:-<none>}"
 echo "输出: $OUTPUT_DIR"
-echo "日志: ${LOG_DIR:-logs/$(basename $OUTPUT_DIR)}"
+echo "日志: ${LOG_DIR:-logs/$(basename "$OUTPUT_DIR")}"
 echo "------------------------------------------"
 echo "图片大小: ${MAX_IMAGE_SIZE}px"
 echo "Batch Size: $BATCH_SIZE"
@@ -108,6 +100,7 @@ echo "Gradient Accumulation: $GRADIENT_ACCUMULATION"
 echo "Num Generations: $NUM_GENERATIONS"
 echo "Learning Rate: $LEARNING_RATE"
 echo "Beta (KL coef): $BETA"
+echo "Reference model mode: $REF_MODEL_MODE"
 echo "LoRA R: $LORA_R"
 echo "Reward scheme: $REWARD_SCHEME"
 echo "Data format: $DATA_FORMAT"
@@ -126,6 +119,7 @@ CMD="python scripts/training/rft/grpo_finetune_trl.py \
     --lora_dropout $LORA_DROPOUT \
     --temperature $TEMPERATURE \
     --beta $BETA \
+    --ref_model_mode $REF_MODEL_MODE \
     --reward_scheme $REWARD_SCHEME \
     --reward_match_iou $REWARD_MATCH_IOU \
     --reward_hallucination_unit_penalty $REWARD_HALLUCINATION_UNIT_PENALTY \
@@ -148,13 +142,16 @@ CMD="python scripts/training/rft/grpo_finetune_trl.py \
     --eval_steps $EVAL_STEPS \
     --logging_steps $LOGGING_STEPS"
 
-# 量化和精度选项 (默认都开启)
 if [ "$DISABLE_4BIT" = "true" ]; then
     CMD="$CMD --no_4bit"
 fi
 
 if [ "$DISABLE_BF16" = "true" ]; then
     CMD="$CMD --no_bf16"
+fi
+
+if [ "$REF_USE_4BIT" = "false" ]; then
+    CMD="$CMD --no_ref_4bit"
 fi
 
 if [ -n "$SFT_MODEL_PATH" ]; then
@@ -173,7 +170,7 @@ if [ -n "$LOG_DIR" ]; then
     CMD="$CMD --log_dir $LOG_DIR"
 fi
 
-_effective_log_dir="${LOG_DIR:-logs/$(basename $OUTPUT_DIR)}"
+_effective_log_dir="${LOG_DIR:-logs/$(basename "$OUTPUT_DIR")}"
 echo ""
 echo "训练完成后，可以使用以下命令查看训练曲线："
 echo "  tensorboard --logdir ${_effective_log_dir}/runs"

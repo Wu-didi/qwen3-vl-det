@@ -38,7 +38,13 @@ class QwenVLGRPOTrainer(GRPOTrainer):
     """
 
     def __init__(self, *args, **kwargs):
+        ref_model = kwargs.pop("ref_model", None)
         super().__init__(*args, **kwargs)
+        if ref_model is not None:
+            ref_model.eval()
+            for parameter in ref_model.parameters():
+                parameter.requires_grad_(False)
+        self.ref_model = ref_model
         # 覆盖为恒等 collator，避免默认 collator 破坏图像字段结构。
         self.data_collator = _identity_collator
 

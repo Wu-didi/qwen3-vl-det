@@ -137,15 +137,28 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _normalize_sub_type(value: Any) -> Optional[str]:
+def _normalize_scalar_label(value: Any) -> Optional[str]:
+    """Collapse singleton list/tuple wrappers and normalize scalar labels."""
+    while isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            return None
+        value = value[0]
+
     if value is None:
         return None
+
     if isinstance(value, str):
         value = value.strip()
-        if value == "" or value.lower() == "null":
-            return None
-        return value
-    return str(value)
+    else:
+        value = str(value).strip()
+
+    if value == "" or value.lower() == "null":
+        return None
+    return value
+
+
+def _normalize_sub_type(value: Any) -> Optional[str]:
+    return _normalize_scalar_label(value)
 
 
 def _normalize_bbox(bbox: Any) -> Optional[List[int]]:
@@ -174,9 +187,9 @@ def _parse_prediction(text: str) -> Optional[List[Dict[str, Any]]]:
     for det in detections:
         if not isinstance(det, dict):
             return None
-        device_type = det.get("device_type")
+        device_type = _normalize_scalar_label(det.get("device_type"))
         sub_type = _normalize_sub_type(det.get("sub_type"))
-        state = det.get("state")
+        state = _normalize_scalar_label(det.get("state"))
         bbox_1000 = _normalize_bbox(det.get("bbox_1000"))
         parsed.append(
             {
@@ -199,9 +212,13 @@ def _is_valid_detection(det: Dict[str, Any]) -> bool:
     state = det.get("state")
     bbox = det.get("bbox_1000")
 
+    if not isinstance(device_type, str):
+        return False
     if device_type not in ALLOWED_DEVICE_TYPES:
         return False
     if sub_type not in ALLOWED_SUB_TYPES:
+        return False
+    if not isinstance(state, str):
         return False
     if state not in ALLOWED_STATES_BY_TYPE.get(device_type, set()):
         return False
@@ -289,6 +306,23 @@ def _match_predictions(
     unmatched_preds = [i for i in range(len(preds)) if i not in used_pred]
     unmatched_gts = [i for i in range(len(gts)) if i not in used_gt]
     return matches, unmatched_preds, unmatched_gts
+
+
+def _safe_fbeta(precision: float, recall: float, beta: float = 2.0) -> float:
+    if precision <= 0.0 and recall <= 0.0:
+        return 0.0
+    beta_sq = beta * beta
+    denom = beta_sq * precision + recall
+    if denom <= 0.0:
+        return 0.0
+    return (1.0 + beta_sq) * precision * recall / denom
+
+
+def _category_key(det: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    device_type = det.get("device_type")
+    if device_type == "traffic_signal":
+        return device_type, det.get("sub_type")
+    return device_type, None
 
 
 # ----------------------------
@@ -512,6 +546,401 @@ def build_reward_funcs(as_list: bool = True):
 def parse_model_output(text: str) -> Optional[List[Dict[str, Any]]]:
     """Public helper for offline debugging."""
     return _parse_prediction(text)
+
+
+# ============================================================
+# V2 reward scheme – 4 orthogonal functions, all in [0, 1]
+# ============================================================
+
+def v2_format_reward(completions, ground_truth, **kwargs) -> List[float]:
+    """Soft format score: JSON parseable +0.5, valid detections +0.3, reasonable count +0.2.
+
+    Parse failure with <box> tags → 0.15 (preserve gradient).
+    """
+    rewards: List[float] = []
+    for completion, gt in zip(completions, ground_truth):
+        text = _completion_to_text(completion)
+        gts = gt.get("detections", []) if isinstance(gt, dict) else []
+        parsed = _parse_prediction(text)
+
+        if parsed is None:
+            # Partial credit if <box> tags present (keeps gradient alive).
+            if re.search(r"<box>", text):
+                rewards.append(0.15)
+            else:
+                rewards.append(0.0)
+            continue
+
+        score = 0.5  # JSON parseable
+
+        # Valid detection structure: all items have required fields.
+        if len(parsed) == 0:
+            # Empty list is structurally valid.
+            score += 0.3
+        else:
+            valid_count = sum(1 for det in parsed if _is_valid_detection(det))
+            score += 0.3 * (valid_count / len(parsed))
+
+        # Reasonable count: not wildly off from GT.
+        gt_count = len(gts)
+        pred_count = len(parsed)
+        if gt_count == 0:
+            # Empty scene: fewer predictions → better.
+            score += 0.2 if pred_count <= 2 else 0.1
+        else:
+            ratio = pred_count / max(gt_count, 1)
+            if 0.5 <= ratio <= 2.0:
+                score += 0.2
+            elif 0.25 <= ratio <= 3.0:
+                score += 0.1
+
+        rewards.append(min(1.0, score))
+    return rewards
+
+
+def v2_detection_f1_reward(completions, ground_truth, **kwargs) -> List[float]:
+    """Detection F1 (80%) + mean IoU quality (20%).
+
+    Uses IoU threshold 0.3 and exact label matching via _label_compatible().
+    """
+    rewards: List[float] = []
+    for completion, gt in zip(completions, ground_truth):
+        text = _completion_to_text(completion)
+        preds = _parse_prediction(text)
+        gts = gt.get("detections", []) if isinstance(gt, dict) else []
+
+        if preds is None:
+            rewards.append(0.0)
+            continue
+
+        preds_valid = [p for p in preds if _is_valid_detection(p)]
+
+        # Both empty → perfect.
+        if len(gts) == 0 and len(preds_valid) == 0:
+            rewards.append(1.0)
+            continue
+        # GT empty but predictions present → 0.
+        if len(gts) == 0:
+            rewards.append(0.0)
+            continue
+        # GT present but no valid predictions → 0.
+        if len(preds_valid) == 0:
+            rewards.append(0.0)
+            continue
+
+        matches, unmatched_preds, unmatched_gts = _match_predictions(
+            preds_valid, gts, iou_threshold=0.3,
+        )
+        tp = len(matches)
+        fp = len(unmatched_preds)
+        fn = len(unmatched_gts)
+        denom = 2 * tp + fp + fn
+        f1 = (2 * tp) / denom if denom > 0 else 0.0
+
+        mean_iou = sum(iou for _, _, iou in matches) / len(matches) if matches else 0.0
+
+        score = 0.8 * f1 + 0.2 * mean_iou
+        rewards.append(min(1.0, score))
+    return rewards
+
+
+def v2_state_reward(completions, ground_truth, **kwargs) -> List[float]:
+    """State accuracy on matched pairs: 70% overall + 30% abnormal accuracy."""
+    rewards: List[float] = []
+    for completion, gt in zip(completions, ground_truth):
+        text = _completion_to_text(completion)
+        preds = _parse_prediction(text)
+        gts = gt.get("detections", []) if isinstance(gt, dict) else []
+
+        if preds is None:
+            rewards.append(0.0)
+            continue
+
+        preds_valid = [p for p in preds if _is_valid_detection(p)]
+
+        if len(gts) == 0 and len(preds_valid) == 0:
+            rewards.append(1.0)
+            continue
+        if len(gts) == 0:
+            rewards.append(0.0)
+            continue
+
+        matches, _, _ = _match_predictions(preds_valid, gts, iou_threshold=0.3)
+        if not matches:
+            rewards.append(0.0)
+            continue
+
+        correct_total = 0
+        correct_abnormal = 0
+        abnormal_count = 0
+        for pi, gi, _ in matches:
+            pred_state = preds_valid[pi]["state"]
+            gt_state = gts[gi]["state"]
+            if pred_state == gt_state:
+                correct_total += 1
+            if gt_state != "normal":
+                abnormal_count += 1
+                if pred_state == gt_state:
+                    correct_abnormal += 1
+
+        overall_acc = correct_total / len(matches)
+        abnormal_acc = (correct_abnormal / abnormal_count) if abnormal_count > 0 else 1.0
+
+        score = 0.7 * overall_acc + 0.3 * abnormal_acc
+        rewards.append(min(1.0, score))
+    return rewards
+
+
+def v2_coverage_reward(completions, ground_truth, **kwargs) -> List[float]:
+    """Category coverage (40%) + instance recall (40%) + recall balance (20%).
+
+    Directly addresses selective category skipping (e.g. backpack_box).
+    """
+    rewards: List[float] = []
+    for completion, gt in zip(completions, ground_truth):
+        text = _completion_to_text(completion)
+        preds = _parse_prediction(text)
+        gts = gt.get("detections", []) if isinstance(gt, dict) else []
+
+        if preds is None:
+            rewards.append(0.0)
+            continue
+
+        preds_valid = [p for p in preds if _is_valid_detection(p)]
+
+        if len(gts) == 0 and len(preds_valid) == 0:
+            rewards.append(1.0)
+            continue
+        if len(gts) == 0:
+            rewards.append(0.0)
+            continue
+        if len(preds_valid) == 0:
+            rewards.append(0.0)
+            continue
+
+        # -- 40%: Category type coverage --
+        gt_types = set()
+        for g in gts:
+            key = g["device_type"]
+            if g["device_type"] == "traffic_signal" and g.get("sub_type"):
+                key = f"{g['device_type']}_{g['sub_type']}"
+            gt_types.add(key)
+
+        pred_types = set()
+        for p in preds_valid:
+            key = p["device_type"]
+            if p["device_type"] == "traffic_signal" and p.get("sub_type"):
+                key = f"{p['device_type']}_{p['sub_type']}"
+            pred_types.add(key)
+
+        type_coverage = len(gt_types & pred_types) / len(gt_types) if gt_types else 1.0
+
+        # -- 40%: Instance recall (loose IoU=0.2) --
+        matches_loose, _, unmatched_gts = _match_predictions(
+            preds_valid, gts, iou_threshold=0.2,
+        )
+        instance_recall = len(matches_loose) / len(gts) if gts else 1.0
+
+        # -- 20%: Recall balance across categories --
+        # Compute per-category recall; min recall penalizes selective skipping.
+        cat_gt_count: Dict[str, int] = {}
+        cat_matched_count: Dict[str, int] = {}
+        for g in gts:
+            key = g["device_type"]
+            cat_gt_count[key] = cat_gt_count.get(key, 0) + 1
+            cat_matched_count.setdefault(key, 0)
+
+        matched_gt_indices = {gi for _, gi, _ in matches_loose}
+        for gi in matched_gt_indices:
+            key = gts[gi]["device_type"]
+            cat_matched_count[key] = cat_matched_count.get(key, 0) + 1
+
+        per_cat_recalls = []
+        for cat_key in cat_gt_count:
+            cat_total = cat_gt_count[cat_key]
+            cat_matched = cat_matched_count.get(cat_key, 0)
+            per_cat_recalls.append(cat_matched / cat_total if cat_total > 0 else 0.0)
+
+        min_recall = min(per_cat_recalls) if per_cat_recalls else 0.0
+
+        score = 0.4 * type_coverage + 0.4 * instance_recall + 0.2 * min_recall
+        rewards.append(min(1.0, score))
+    return rewards
+
+
+def simple_format_reward(completions, ground_truth, **kwargs) -> List[float]:
+    """
+    Reward valid JSON structure while avoiding positive credit for empty positive samples.
+
+    This keeps a small format incentive but stops the old failure mode where
+    `{"detections":[]}` on a positive scene still produced a meaningful reward.
+    """
+    rewards: List[float] = []
+    for completion, gt in zip(completions, ground_truth):
+        text = _completion_to_text(completion)
+        parsed = _parse_prediction(text)
+        gts = gt.get("detections", []) if isinstance(gt, dict) else []
+
+        if parsed is None:
+            rewards.append(0.0)
+            continue
+
+        if len(parsed) == 0:
+            rewards.append(1.0 if len(gts) == 0 else 0.0)
+            continue
+
+        valid_count = sum(1 for det in parsed if _is_valid_detection(det))
+        if len(gts) > 0 and valid_count == 0:
+            rewards.append(0.0)
+            continue
+
+        rewards.append(valid_count / len(parsed))
+    return rewards
+
+
+def simple_detection_reward(completions, ground_truth, **kwargs) -> List[float]:
+    """
+    Main optimization target: instance F2 at IoU=0.5 with a small IoU quality term.
+
+    F2 gives recall more weight than precision, which is a better fit for the
+    current failure mode (systematically skipping hard classes / small objects).
+    """
+    rewards: List[float] = []
+    for completion, gt in zip(completions, ground_truth):
+        text = _completion_to_text(completion)
+        parsed = _parse_prediction(text)
+        gts = gt.get("detections", []) if isinstance(gt, dict) else []
+
+        if parsed is None:
+            rewards.append(0.0)
+            continue
+
+        preds_valid = [pred for pred in parsed if _is_valid_detection(pred)]
+
+        if len(gts) == 0:
+            rewards.append(1.0 if len(preds_valid) == 0 else 0.0)
+            continue
+        if len(preds_valid) == 0:
+            rewards.append(0.0)
+            continue
+
+        matches, unmatched_preds, unmatched_gts = _match_predictions(
+            preds_valid,
+            gts,
+            iou_threshold=0.5,
+        )
+        tp = len(matches)
+        fp = len(unmatched_preds)
+        fn = len(unmatched_gts)
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f2 = _safe_fbeta(precision, recall, beta=2.0)
+        mean_iou = sum(iou for _, _, iou in matches) / len(matches) if matches else 0.0
+        rewards.append(min(1.0, 0.85 * f2 + 0.15 * mean_iou))
+    return rewards
+
+
+def simple_state_reward(completions, ground_truth, **kwargs) -> List[float]:
+    """State accuracy on IoU=0.5 matched pairs only."""
+    rewards: List[float] = []
+    for completion, gt in zip(completions, ground_truth):
+        text = _completion_to_text(completion)
+        parsed = _parse_prediction(text)
+        gts = gt.get("detections", []) if isinstance(gt, dict) else []
+
+        if parsed is None:
+            rewards.append(0.0)
+            continue
+
+        preds_valid = [pred for pred in parsed if _is_valid_detection(pred)]
+
+        if len(gts) == 0:
+            rewards.append(1.0 if len(preds_valid) == 0 else 0.0)
+            continue
+
+        matches, _, _ = _match_predictions(preds_valid, gts, iou_threshold=0.5)
+        if not matches:
+            rewards.append(0.0)
+            continue
+
+        correct = 0
+        for pred_idx, gt_idx, _ in matches:
+            if preds_valid[pred_idx]["state"] == gts[gt_idx]["state"]:
+                correct += 1
+        rewards.append(correct / len(matches))
+    return rewards
+
+
+def simple_category_recall_reward(completions, ground_truth, **kwargs) -> List[float]:
+    """
+    Macro recall over GT categories at IoU=0.5.
+
+    This directly penalizes the current failure mode where the policy learns to
+    report easy classes but drops hard ones such as backpack_box.
+    """
+    rewards: List[float] = []
+    for completion, gt in zip(completions, ground_truth):
+        text = _completion_to_text(completion)
+        parsed = _parse_prediction(text)
+        gts = gt.get("detections", []) if isinstance(gt, dict) else []
+
+        if parsed is None:
+            rewards.append(0.0)
+            continue
+
+        preds_valid = [pred for pred in parsed if _is_valid_detection(pred)]
+
+        if len(gts) == 0:
+            rewards.append(1.0 if len(preds_valid) == 0 else 0.0)
+            continue
+        if len(preds_valid) == 0:
+            rewards.append(0.0)
+            continue
+
+        matches, _, _ = _match_predictions(preds_valid, gts, iou_threshold=0.5)
+        gt_total_by_cat: Dict[Tuple[Optional[str], Optional[str]], int] = {}
+        gt_matched_by_cat: Dict[Tuple[Optional[str], Optional[str]], int] = {}
+
+        for gt_det in gts:
+            key = _category_key(gt_det)
+            gt_total_by_cat[key] = gt_total_by_cat.get(key, 0) + 1
+            gt_matched_by_cat.setdefault(key, 0)
+
+        for _, gt_idx, _ in matches:
+            key = _category_key(gts[gt_idx])
+            gt_matched_by_cat[key] = gt_matched_by_cat.get(key, 0) + 1
+
+        per_category_recalls = [
+            gt_matched_by_cat[key] / total
+            for key, total in gt_total_by_cat.items()
+            if total > 0
+        ]
+        rewards.append(sum(per_category_recalls) / len(per_category_recalls))
+    return rewards
+
+
+def build_v2_reward_funcs():
+    """Return (funcs, weights) for the v2 reward scheme."""
+    funcs = [
+        v2_format_reward,
+        v2_detection_f1_reward,
+        v2_state_reward,
+        v2_coverage_reward,
+    ]
+    weights = [1.0, 3.0, 2.0, 2.0]
+    return funcs, weights
+
+
+def build_simple_reward_funcs():
+    """Return a small reward bundle aligned with AP50-style detection quality."""
+    funcs = [
+        simple_format_reward,
+        simple_detection_reward,
+        simple_state_reward,
+        simple_category_recall_reward,
+    ]
+    weights = [0.2, 4.0, 1.0, 2.5]
+    return funcs, weights
 
 
 if __name__ == "__main__":

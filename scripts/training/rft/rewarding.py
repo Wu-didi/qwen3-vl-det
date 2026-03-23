@@ -122,10 +122,6 @@ def _normalize_category_alias(category: str) -> str:
     normalized = re.sub(r"\s+", "", category.strip().lower())
     if normalized in CATEGORY_ALIASES:
         return CATEGORY_ALIASES[normalized]
-
-    for alias, canonical in CATEGORY_ALIASES.items():
-        if alias in category or alias in normalized:
-            return canonical
     return normalized
 
 
@@ -692,14 +688,14 @@ def _is_anomaly_status(status: str) -> bool:
 
 
 def _category_match(pred_category: str, gt_category: str) -> bool:
-    """类别模糊匹配（完全相等或包含关系）。"""
+    """类别精确匹配（归一化后完全相等）。"""
     pred = _normalize_category(pred_category)
     gt = _normalize_category(gt_category)
     if not pred or not gt:
         return False
     if pred == "unknown" or gt == "unknown":
         return False
-    return pred == gt or pred in gt or gt in pred
+    return pred == gt
 
 
 def _extract_detections(text: str) -> List[ParsedDetection]:

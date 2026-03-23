@@ -1,0 +1,83 @@
+{
+  "iou_threshold": 0.95,
+  "overall": {
+    "ap": 0.0034161370432022773,
+    "precision": 0.01756756756756757,
+    "recall": 0.009618941916389198,
+    "f1_score": 0.012431269423858476,
+    "tp": 26,
+    "fp": 1454,
+    "fn": 2677,
+    "num_gt": 2703,
+    "num_pred": 1480,
+    "iou_mean": 0.9601817964551844,
+    "iou_std": 0.008458946153880681
+  },
+  "per_class": {
+    "backpack_box": {
+      "ap": 0.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1_score": 0.0,
+      "tp": 0,
+      "fp": 3,
+      "fn": 517,
+      "num_gt": 517,
+      "num_pred": 3,
+      "iou_mean": 0.0,
+      "iou_std": 0.0
+    },
+    "cabinet": {
+      "ap": 0.0025403856640995137,
+      "precision": 0.07253886010362694,
+      "recall": 0.029106029106029108,
+      "f1_score": 0.04154302670623145,
+      "tp": 14,
+      "fp": 179,
+      "fn": 467,
+      "num_gt": 481,
+      "num_pred": 193,
+      "iou_mean": 0.9625557820049904,
+      "iou_std": 0.009844118163044004
+    },
+    "guidance_screen": {
+      "ap": 0.014540299551911873,
+      "precision": 0.06,
+      "recall": 0.06741573033707865,
+      "f1_score": 0.06349206349206349,
+      "tp": 12,
+      "fp": 188,
+      "fn": 166,
+      "num_gt": 178,
+      "num_pred": 200,
+      "iou_mean": 0.9574121466470779,
+      "iou_std": 0.00526586430856649
+    },
+    "height_limit_bar": {
+      "ap": 0.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1_score": 0.0,
+      "tp": 0,
+      "fp": 47,
+      "fn": 151,
+      "num_gt": 151,
+      "num_pred": 47,
+      "iou_mean": 0.0,
+      "iou_std": 0.0
+    },
+    "traffic_signal": {
+      "ap": 0.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1_score": 0.0,
+      "tp": 0,
+      "fp": 1037,
+      "fn": 1376,
+      "num_gt": 1376,
+      "num_pred": 1037,
+      "iou_mean": 0.0,
+      "iou_std": 0.0
+    }
+  }
+}
