@@ -67,6 +67,48 @@ def test_simple_category_recall_penalizes_missing_hard_class():
     assert simple_detection_reward([completion], ground_truth=ground_truth)[0] < 1.0
 
 
+def test_simple_rewards_align_with_eval_and_ignore_traffic_signal_subtype_for_matching():
+    completion = json.dumps(
+        {
+            "detections": [
+                {
+                    "device_type": "traffic_signal",
+                    "sub_type": "vehicle_signal",
+                    "state": "abnormal",
+                    "bbox_1000": [50, 50, 120, 220],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    ground_truth = [
+        {
+            "detections": [
+                {
+                    "device_type": "traffic_signal",
+                    "sub_type": "pedestrian_signal",
+                    "state": "abnormal",
+                    "bbox_1000": [50, 50, 120, 220],
+                }
+            ]
+        }
+    ]
+
+    assert simple_detection_reward([completion], ground_truth=ground_truth) == [1.0]
+    assert simple_state_reward([completion], ground_truth=ground_truth) == [1.0]
+    assert simple_category_recall_reward([completion], ground_truth=ground_truth) == [1.0]
+
+
+def test_simple_empty_scene_does_not_stack_state_and_category_rewards():
+    completion = json.dumps({"detections": []}, ensure_ascii=False)
+    ground_truth = [{"detections": []}]
+
+    assert simple_format_reward([completion], ground_truth=ground_truth) == [1.0]
+    assert simple_detection_reward([completion], ground_truth=ground_truth) == [1.0]
+    assert simple_state_reward([completion], ground_truth=ground_truth) == [0.0]
+    assert simple_category_recall_reward([completion], ground_truth=ground_truth) == [0.0]
+
+
 def test_convert_sample_keeps_sft_prompt_and_structured_ground_truth():
     sft_sample = {
         "image": "/tmp/example.jpg",

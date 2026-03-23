@@ -41,7 +41,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 ALLOWED_DEVICE_TYPES = {
@@ -268,10 +268,16 @@ def _label_compatible(pred: Dict[str, Any], gt: Dict[str, Any]) -> bool:
     return True
 
 
+def _eval_aligned_label_compatible(pred: Dict[str, Any], gt: Dict[str, Any]) -> bool:
+    """Match the offline evaluator: device_type + IoU only."""
+    return pred.get("device_type") == gt.get("device_type")
+
+
 def _match_predictions(
     preds: List[Dict[str, Any]],
     gts: List[Dict[str, Any]],
     iou_threshold: float = 0.5,
+    label_compatible_fn: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = None,
 ) -> Tuple[List[Tuple[int, int, float]], List[int], List[int]]:
     """
     Greedy one-to-one matching under label compatibility and IoU threshold.
@@ -281,11 +287,12 @@ def _match_predictions(
         unmatched_gt_indices
     """
     candidates: List[Tuple[float, int, int]] = []
+    label_compatible_fn = label_compatible_fn or _label_compatible
     for pi, pred in enumerate(preds):
         if pred.get("bbox_1000") is None:
             continue
         for gi, gt in enumerate(gts):
-            if not _label_compatible(pred, gt):
+            if not label_compatible_fn(pred, gt):
                 continue
             iou = _iou_xyxy(pred["bbox_1000"], gt["bbox_1000"])
             if iou >= iou_threshold:
@@ -319,9 +326,8 @@ def _safe_fbeta(precision: float, recall: float, beta: float = 2.0) -> float:
 
 
 def _category_key(det: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """Offline evaluator only groups JSON detections by device_type."""
     device_type = det.get("device_type")
-    if device_type == "traffic_signal":
-        return device_type, det.get("sub_type")
     return device_type, None
 
 
@@ -828,6 +834,7 @@ def simple_detection_reward(completions, ground_truth, **kwargs) -> List[float]:
             preds_valid,
             gts,
             iou_threshold=0.5,
+            label_compatible_fn=_eval_aligned_label_compatible,
         )
         tp = len(matches)
         fp = len(unmatched_preds)
@@ -855,10 +862,15 @@ def simple_state_reward(completions, ground_truth, **kwargs) -> List[float]:
         preds_valid = [pred for pred in parsed if _is_valid_detection(pred)]
 
         if len(gts) == 0:
-            rewards.append(1.0 if len(preds_valid) == 0 else 0.0)
+            rewards.append(0.0)
             continue
 
-        matches, _, _ = _match_predictions(preds_valid, gts, iou_threshold=0.5)
+        matches, _, _ = _match_predictions(
+            preds_valid,
+            gts,
+            iou_threshold=0.5,
+            label_compatible_fn=_eval_aligned_label_compatible,
+        )
         if not matches:
             rewards.append(0.0)
             continue
@@ -891,13 +903,18 @@ def simple_category_recall_reward(completions, ground_truth, **kwargs) -> List[f
         preds_valid = [pred for pred in parsed if _is_valid_detection(pred)]
 
         if len(gts) == 0:
-            rewards.append(1.0 if len(preds_valid) == 0 else 0.0)
+            rewards.append(0.0)
             continue
         if len(preds_valid) == 0:
             rewards.append(0.0)
             continue
 
-        matches, _, _ = _match_predictions(preds_valid, gts, iou_threshold=0.5)
+        matches, _, _ = _match_predictions(
+            preds_valid,
+            gts,
+            iou_threshold=0.5,
+            label_compatible_fn=_eval_aligned_label_compatible,
+        )
         gt_total_by_cat: Dict[Tuple[Optional[str], Optional[str]], int] = {}
         gt_matched_by_cat: Dict[Tuple[Optional[str], Optional[str]], int] = {}
 
@@ -939,7 +956,7 @@ def build_simple_reward_funcs():
         simple_state_reward,
         simple_category_recall_reward,
     ]
-    weights = [0.2, 4.0, 1.0, 2.5]
+    weights = [0.2, 4.0, 1.0, 1.5]
     return funcs, weights
 
 
